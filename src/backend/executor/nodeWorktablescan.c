@@ -51,11 +51,13 @@ WorkTableScanNext(WorkTableScanState *node)
 
 	tuplestorestate = node->rustate->working_table;
 
+	tuplestore_select_read_pointer(tuplestorestate, node->readptr);
+
 	/*
 	 * Get the next tuple from tuplestore. Return NULL if no more tuples.
 	 */
 	slot = node->ss.ss_ScanTupleSlot;
-	(void) tuplestore_gettupleslot(tuplestorestate, true, false, slot);
+	(void) tuplestore_gettupleslot(tuplestorestate, true, true, slot);
 	return slot;
 }
 
@@ -114,6 +116,14 @@ ExecWorkTableScan(PlanState *pstate)
 		 * before we can call ExecScan().
 		 */
 		ExecAssignScanProjectionInfo(&node->ss);
+
+		/* Initialize readonly pointer of tuplestore  */
+		{
+			Tuplestorestate * tuplestorestate = node->rustate->working_table;
+			node->readptr = tuplestore_alloc_read_pointer(tuplestorestate, EXEC_FLAG_REWIND);
+			tuplestore_select_read_pointer(tuplestorestate, node->readptr);
+			tuplestore_rescan(tuplestorestate);
+		}
 	}
 
 	return ExecScan(&node->ss,
@@ -197,5 +207,8 @@ ExecReScanWorkTableScan(WorkTableScanState *node)
 
 	/* No need (or way) to rescan if ExecWorkTableScan not called yet */
 	if (node->rustate)
+	{
+		tuplestore_select_read_pointer(node->rustate->working_table, node->readptr);
 		tuplestore_rescan(node->rustate->working_table);
+	}
 }

@@ -2091,6 +2091,7 @@ typedef struct NamedTuplestoreScanState
 typedef struct WorkTableScanState
 {
 	ScanState	ss;				/* its first field is NodeTag */
+	int			readptr;		/* index of my tuplestore read pointer */// TODO: implement pprint for new field		
 	RecursiveUnionState *rustate;
 } WorkTableScanState;
 
