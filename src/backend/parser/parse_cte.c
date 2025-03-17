@@ -949,7 +949,7 @@ checkWellFormedRecursion(CteState *cstate)
 		cstate->context = RECURSION_OK;
 		checkWellFormedRecursionWalker((Node *) stmt->rarg, cstate);
 		Assert(cstate->innerwiths == NIL);
-		if (cstate->selfrefcount != 1)	/* shouldn't happen */
+		if (cstate->selfrefcount < 1)	/* shouldn't happen */
 			elog(ERROR, "missing recursive reference");
 	}
 }
@@ -992,24 +992,7 @@ checkWellFormedRecursionWalker(Node *node, CteState *cstate)
 			/* No, could be a reference to the query level we are working on */
 			mycte = cstate->items[cstate->curitem].cte;
 			if (strcmp(rv->relname, mycte->ctename) == 0)
-			{
-				/* Found a recursive reference to the active query */
-				if (cstate->context != RECURSION_OK)
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_RECURSION),
-							 errmsg(recursion_errormsgs[cstate->context],
-									mycte->ctename),
-							 parser_errposition(cstate->pstate,
-												rv->location)));
-				/* Count references */
-				if (++(cstate->selfrefcount) > 1)
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_RECURSION),
-							 errmsg("recursive reference to query \"%s\" must not appear more than once",
-									mycte->ctename),
-							 parser_errposition(cstate->pstate,
-												rv->location)));
-			}
+				(cstate->selfrefcount)++;
 		}
 		return false;
 	}
