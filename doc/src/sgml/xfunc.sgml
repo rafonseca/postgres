@@ -249,6 +249,13 @@ CALL clean_emp();
      </para>
    </note>
 
+    <note>
+     <para>
+       Except when inlined, an SQL function is always executed with a
+       generic plan. This behavior may not be desired in some situations.
+     </para>
+    </note>
+
    <para>
     The syntax of the <command>CREATE FUNCTION</command> command requires
     the function body to be written as a string constant.  It is usually
