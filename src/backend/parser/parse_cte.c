@@ -974,25 +974,25 @@ checkWellFormedRecursion(CteState *cstate)
 		if (stmt->sortClause)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("ORDER BY in a recursive query is not implemented"),
+					 errmsg("ORDER BY at the top level of a recursive query is not allowed"),
 					 parser_errposition(cstate->pstate,
 										exprLocation((Node *) stmt->sortClause))));
 		if (stmt->limitOffset)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("OFFSET in a recursive query is not implemented"),
+					 errmsg("OFFSET at the top level of a recursive query is not allowed"),
 					 parser_errposition(cstate->pstate,
 										exprLocation(stmt->limitOffset))));
 		if (stmt->limitCount)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("LIMIT in a recursive query is not implemented"),
+					 errmsg("LIMIT at the top level of a recursive query is not allowed"),
 					 parser_errposition(cstate->pstate,
 										exprLocation(stmt->limitCount))));
 		if (stmt->lockingClause)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("FOR UPDATE/SHARE in a recursive query is not implemented"),
+					 errmsg("FOR UPDATE/SHARE at the top level of a recursive query is not allowed"),
 					 parser_errposition(cstate->pstate,
 										exprLocation((Node *) stmt->lockingClause))));
 
