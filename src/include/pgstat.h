@@ -111,6 +111,8 @@ typedef struct PgStat_BackendSubEntry
 	PgStat_Counter conflict_count[CONFLICT_NUM_TYPES];
 } PgStat_BackendSubEntry;
 
+#define DEAD_TUPLES_HIST_SIZE 5
+
 /* ----------
  * PgStat_TableCounts			The actual per-table counts kept by a backend
  *
@@ -150,6 +152,9 @@ typedef struct PgStat_TableCounts
 	PgStat_Counter delta_live_tuples;
 	PgStat_Counter delta_dead_tuples;
 	PgStat_Counter changed_tuples;
+
+	PgStat_Counter dead_tuples_xid_freqs[DEAD_TUPLES_HIST_SIZE];
+	TransactionId dead_tuples_xid_bounds[DEAD_TUPLES_HIST_SIZE];
 
 	PgStat_Counter blocks_fetched;
 	PgStat_Counter blocks_hit;
@@ -211,7 +216,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCB7
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCB8
 
 typedef struct PgStat_ArchiverStats
 {
@@ -418,6 +423,7 @@ typedef struct PgStat_StatSubEntry
 	TimestampTz stat_reset_timestamp;
 } PgStat_StatSubEntry;
 
+
 typedef struct PgStat_StatTabEntry
 {
 	PgStat_Counter numscans;
@@ -436,6 +442,9 @@ typedef struct PgStat_StatTabEntry
 	PgStat_Counter dead_tuples;
 	PgStat_Counter mod_since_analyze;
 	PgStat_Counter ins_since_vacuum;
+
+	PgStat_Counter dead_tuples_xid_freq[DEAD_TUPLES_HIST_SIZE];
+	TransactionId dead_tuples_xid_bounds[DEAD_TUPLES_HIST_SIZE];
 
 	PgStat_Counter blocks_fetched;
 	PgStat_Counter blocks_hit;
@@ -717,6 +726,9 @@ extern void pgstat_count_heap_update(Relation rel, bool hot, bool newpage);
 extern void pgstat_count_heap_delete(Relation rel);
 extern void pgstat_count_truncate(Relation rel);
 extern void pgstat_update_heap_dead_tuples(Relation rel, int delta);
+extern void pgstat_update_dead_tuples_xid(PgStat_StatTabEntry *tabentry, const PgStat_TableStatus *lstats);
+extern void pgstat_balance_dead_tuples_xid(PgStat_Counter *freqs, TransactionId *bounds);
+
 
 extern void pgstat_twophase_postcommit(TransactionId xid, uint16 info,
 									   void *recdata, uint32 len);

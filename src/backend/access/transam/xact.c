@@ -460,6 +460,17 @@ GetCurrentTransactionId(void)
 	return XidFromFullTransactionId(s->fullTransactionId);
 }
 
+TransactionId
+GetCurrentTransactionMaxChildId(void)
+{
+	TransactionState s = CurrentTransactionState;
+
+	if (s->nChildXids == 0)
+		return InvalidTransactionId;
+	else
+		return s->childXids[s->nChildXids - 1];
+}
+
 /*
  *	GetCurrentTransactionIdIfAny
  *
