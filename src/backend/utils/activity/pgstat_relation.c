@@ -15,6 +15,7 @@
  * -------------------------------------------------------------------------
  */
 
+#include "c.h"
 #include "postgres.h"
 
 #include "access/twophase_rmgr.h"
@@ -461,6 +462,78 @@ pgstat_update_heap_dead_tuples(Relation rel, int delta)
 }
 
 /*
+ * This function updates dead_tuples_xid histogram of respective table in
+ * shared PgStat_StatTabEntry using information from local backend stats. It
+ * is executed in a hot path, so we don't handle histogram maintenance here.
+ */
+void
+pg_stat_update_dead_tuples_xid(PgStat_StatTabEntry *tabentry, const PgStat_TableStatus *lstats)
+{
+	PgStat_Counter delta_dead_tuples = lstats->counts.delta_dead_tuples;
+	TransactionId xid = lstats->counts.xid;
+	int			bin;
+
+	/* find first suitable bin from higher to lower. here, we do not take into */
+	/* account the upper bound of the highest bin since it is an *open* bin */
+	for (bin = DEAD_TUPLES_HIST_SIZE - 1; bin > 0; bin--)
+	{
+		TransactionId lower_bound = tabentry->dead_tuples_xid_freq[bin - 1];
+
+		if ((xid > lower_bound) || (lower_bound == 0))
+			break;
+	}
+	tabentry->dead_tuples_xid_freq[bin] += delta_dead_tuples;
+	tabentry->dead_tuples_xid_bounds[bin] = Max(tabentry->dead_tuples_xid_bounds[bin], xid);
+	/* Note: this does not takes into account xid wrap-around */
+
+	/*
+	 * We balance the histogram here for dev/testing purposes, but it should
+	 * run somewhere else.
+	 */
+	pg_stat_balance_dead_tuples_xid(tabentry);
+}
+
+/*
+ * If conditions are satisfied, merge two adjacent *closed* bins and shift
+ * data to create a new *open* bin. Then, previous *open* bin becomes a
+ * *closed* one. We perform the balance operation when the freqs of the *open*
+ * bin is higher than the combined freqs of a pair of adjacent *closed*
+ * bins. The merged bin has the sum of freqs and the higher upper bound of the
+ * pair.
+ * This should be run periodically for every table as a BG worker.
+ */
+void
+pg_stat_balance_dead_tuples_xid(PgStat_StatTabEntry *tabentry)
+{
+	TransactionId *bounds = tabentry->dead_tuples_xid_bounds;
+	PgStat_Counter *freqs = tabentry->dead_tuples_xid_freq;
+	PgStat_Counter open_bin_freq = freqs[DEAD_TUPLES_HIST_SIZE - 1];
+	PgStat_Counter combined_bins_freq;
+	int			bin;
+
+	for (bin = DEAD_TUPLES_HIST_SIZE - 2; bin > 0; bin--)
+	{
+		combined_bins_freq = freqs[bin] + freqs[bin - 1];
+		if (open_bin_freq > combined_bins_freq)
+			break;
+	}
+	if (bin > 0)
+		/* then merge and shift */
+	{
+		freqs[bin - 1] = freqs[bin] + freqs[bin - 1];
+		bounds[bin - 1] = bounds[bin];
+		for (; bin < DEAD_TUPLES_HIST_SIZE - 1; bin++)
+		{
+			freqs[bin] = freqs[bin + 1];
+			bounds[bin] = bounds[bin + 1];
+		}
+		freqs[bin] = 0;
+	}
+}
+
+/*  TODO: test */
+
+/*
  * Support function for the SQL-callable pgstat* functions. Returns
  * the collected statistics for one table or NULL. NULL doesn't mean
  * that the table doesn't exist, just that there are no statistics, so the
@@ -595,7 +668,12 @@ AtEOXact_PgStat_Relations(PgStat_SubXactStatus *xact_state, bool isCommit)
 			/* an aborted xact generates no changed_tuple events */
 		}
 		tabstat->trans = NULL;
+
+		Assert(xact_state->first->parent == tabstat);
+		/* suppose there is only one tabstat */
 	}
+	/* update xid only once */
+	xact_state->first->parent->counts.xid = GetCurrentTransactionId();
 }
 
 /*
@@ -863,10 +941,13 @@ pgstat_relation_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
 		tabentry->live_tuples = 0;
 		tabentry->dead_tuples = 0;
 		tabentry->ins_since_vacuum = 0;
+		MemSet(tabentry->dead_tuples_xid_freq, 0, 5 * sizeof(PgStat_Counter));
+		MemSet(tabentry->dead_tuples_xid_bounds, 0, 5 * sizeof(TransactionId));
 	}
 
 	tabentry->live_tuples += lstats->counts.delta_live_tuples;
 	tabentry->dead_tuples += lstats->counts.delta_dead_tuples;
+	pg_stat_update_dead_tuples_xid(tabentry, lstats);
 	tabentry->mod_since_analyze += lstats->counts.changed_tuples;
 	tabentry->ins_since_vacuum += lstats->counts.tuples_inserted;
 	tabentry->blocks_fetched += lstats->counts.blocks_fetched;
