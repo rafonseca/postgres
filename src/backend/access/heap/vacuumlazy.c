@@ -355,6 +355,8 @@ typedef struct LVRelState
 	int64		live_tuples;	/* # live tuples remaining */
 	int64		recently_dead_tuples;	/* # dead, but not yet removable */
 	int64		missed_dead_tuples; /* # removable, but not removed */
+	PgStat_Counter dead_tuples_xid_freqs[DEAD_TUPLES_HIST_SIZE];
+	TransactionId dead_tuples_xid_bounds[DEAD_TUPLES_HIST_SIZE];
 
 	/* State maintained by heap_vac_scan_next_block() */
 	BlockNumber current_block;	/* last block returned */
@@ -939,6 +941,8 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 						 Max(vacrel->new_live_tuples, 0),
 						 vacrel->recently_dead_tuples +
 						 vacrel->missed_dead_tuples,
+						 vacrel->dead_tuples_xid_freqs,
+						 vacrel->dead_tuples_xid_bounds,
 						 starttime);
 	pgstat_progress_end_command();
 
@@ -1954,6 +1958,8 @@ lazy_scan_prune(LVRelState *vacrel,
 	Relation	rel = vacrel->rel;
 	PruneFreezeResult presult;
 	int			prune_options = 0;
+	TransactionId page_dead_tuple_xid_lower_bound;
+	TransactionId page_dead_tuple_xid_upper_bound;
 
 	Assert(BufferGetBlockNumber(buf) == blkno);
 
@@ -1975,12 +1981,15 @@ lazy_scan_prune(LVRelState *vacrel,
 	prune_options = HEAP_PAGE_PRUNE_FREEZE;
 	if (vacrel->nindexes == 0)
 		prune_options |= HEAP_PAGE_PRUNE_MARK_UNUSED_NOW;
-
+	page_dead_tuple_xid_lower_bound = vacrel->NewRelfrozenXid;
 	heap_page_prune_and_freeze(rel, buf, vacrel->vistest, prune_options,
 							   &vacrel->cutoffs, &presult, PRUNE_VACUUM_SCAN,
 							   &vacrel->offnum,
 							   &vacrel->NewRelfrozenXid, &vacrel->NewRelminMxid);
-
+	page_dead_tuple_xid_upper_bound = vacrel->NewRelfrozenXid;
+	/* This is the min xid of live tuples in this page, so it should be */
+	/* excluded from the range. Right now, we don't use the upper bound */
+	/* anyway. */
 	Assert(MultiXactIdIsValid(vacrel->NewRelminMxid));
 	Assert(TransactionIdIsValid(vacrel->NewRelfrozenXid));
 
@@ -2048,6 +2057,14 @@ lazy_scan_prune(LVRelState *vacrel,
 	vacrel->live_tuples += presult.live_tuples;
 	vacrel->recently_dead_tuples += presult.recently_dead_tuples;
 
+	update_xid_histogram(
+						 vacrel->dead_tuples_xid_freqs,
+						 vacrel->dead_tuples_xid_bounds,
+						 -presult.ndeleted,
+						 page_dead_tuple_xid_lower_bound,
+						 page_dead_tuple_xid_upper_bound);
+
+	ereport(LOG, errmsg("updating xid_hist in vacuumlazy.c. delta_freq: %d, low_xid: %d, high_xid: %d", -presult.ndeleted, page_dead_tuple_xid_lower_bound, page_dead_tuple_xid_upper_bound));
 	/* Can't truncate this page */
 	if (presult.hastup)
 		vacrel->nonempty_pages = blkno + 1;

@@ -29,6 +29,7 @@
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/acl.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/timestamp.h"
 
@@ -69,6 +70,49 @@ PG_STAT_GET_RELENTRY_INT64(blocks_hit)
 
 /* pg_stat_get_dead_tuples */
 PG_STAT_GET_RELENTRY_INT64(dead_tuples)
+
+/* pg_stat_get_dead_tuples_xid_freqs */
+Datum
+pg_stat_get_dead_tuples_xid_freqs(FunctionCallInfo fcinfo)
+{
+	Oid			relid = DatumGetObjectId((fcinfo->args[0].value));
+	Datum	   *result;
+	PgStat_StatTabEntry *tabentry;
+	int			i;
+
+	tabentry = pgstat_fetch_stat_tabentry(relid);
+	if (tabentry == ((void *) 0))
+		/* OID not found */
+		PG_RETURN_ARRAYTYPE_P(construct_empty_array(XIDOID));
+
+	result = palloc(DEAD_TUPLES_HIST_SIZE * sizeof(Datum));
+	for (i = 0; i < DEAD_TUPLES_HIST_SIZE; i++)
+		result[i] = Int64GetDatum(tabentry->dead_tuples_xid_freq[i]);
+
+	PG_RETURN_ARRAYTYPE_P(construct_array_builtin(result, 5, XIDOID));
+}
+
+/* pg_stat_get_dead_tuples_xid_bounds */
+Datum
+pg_stat_get_dead_tuples_xid_bounds(FunctionCallInfo fcinfo)
+{
+	Oid			relid = DatumGetObjectId((fcinfo->args[0].value));
+	Datum	   *result;
+	PgStat_StatTabEntry *tabentry;
+	int			i;
+
+	tabentry = pgstat_fetch_stat_tabentry(relid);
+	if (tabentry == ((void *) 0))
+		/* OID not found */
+		PG_RETURN_ARRAYTYPE_P(construct_empty_array(INT8OID));
+
+	result = palloc(DEAD_TUPLES_HIST_SIZE * sizeof(Datum));
+	for (i = 0; i < DEAD_TUPLES_HIST_SIZE; i++)
+		result[i] = TransactionIdGetDatum(tabentry->dead_tuples_xid_bounds[i]);
+
+	PG_RETURN_ARRAYTYPE_P(construct_array_builtin(result, 5, INT8OID));
+}
+
 
 /* pg_stat_get_ins_since_vacuum */
 PG_STAT_GET_RELENTRY_INT64(ins_since_vacuum)

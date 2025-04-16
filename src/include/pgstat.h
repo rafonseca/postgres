@@ -111,6 +111,8 @@ typedef struct PgStat_BackendSubEntry
 	PgStat_Counter conflict_count[CONFLICT_NUM_TYPES];
 } PgStat_BackendSubEntry;
 
+#define DEAD_TUPLES_HIST_SIZE 5
+
 /* ----------
  * PgStat_TableCounts			The actual per-table counts kept by a backend
  *
@@ -131,6 +133,23 @@ typedef struct PgStat_BackendSubEntry
  * actions, regardless of whether the transaction committed.  delta_live_tuples,
  * delta_dead_tuples, and changed_tuples are set depending on commit or abort.
  * Note that delta_live_tuples and delta_dead_tuples can be negative!
+ *
+ * delta_tuples_xid_freqs and dead_tuples_xid_bounds together represent an
+ * histogram of dead tuples xmin related to a backend. dead_tuples_xid_bounds
+ * contains the upper bounds of each bin. On flush_pending_cb, this histogram
+ * is merged into a similar structure in PgStat_StatTabEntry. While we loose
+ * some information in this merge, because the bounds are not the same, we can
+ * still guarantee the semantic of an upper bound. In other words, in the
+ * final structure if the accumulated freqs up to a given upper bound is 200
+ * tuples, the actual number of dead tuples is *at least* 200, and this
+ * behavior is only due to the merging process. Of course, there can be other
+ * sources of mismatch, but this is what concerns us here. In practice, if the
+ * flush_pending_cb runs often enough so that there are no more than
+ * DEAD_TUPLES_HIST_SIZE transactions in current PgStat_TableCounts, the
+ * results will be accurate and without information loss. Finally, we could
+ * consider a much simpler structure at this point to the detriment of
+ * granularity.
+ *
  * ----------
  */
 typedef struct PgStat_TableCounts
@@ -150,6 +169,9 @@ typedef struct PgStat_TableCounts
 	PgStat_Counter delta_live_tuples;
 	PgStat_Counter delta_dead_tuples;
 	PgStat_Counter changed_tuples;
+
+	PgStat_Counter dead_tuples_xid_freqs[DEAD_TUPLES_HIST_SIZE];
+	TransactionId dead_tuples_xid_bounds[DEAD_TUPLES_HIST_SIZE];
 
 	PgStat_Counter blocks_fetched;
 	PgStat_Counter blocks_hit;
@@ -211,7 +233,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCB7
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCB8
 
 typedef struct PgStat_ArchiverStats
 {
@@ -437,6 +459,9 @@ typedef struct PgStat_StatTabEntry
 	PgStat_Counter mod_since_analyze;
 	PgStat_Counter ins_since_vacuum;
 
+	PgStat_Counter dead_tuples_xid_freq[DEAD_TUPLES_HIST_SIZE];
+	TransactionId dead_tuples_xid_bounds[DEAD_TUPLES_HIST_SIZE];
+
 	PgStat_Counter blocks_fetched;
 	PgStat_Counter blocks_hit;
 
@@ -660,6 +685,7 @@ extern void pgstat_unlink_relation(Relation rel);
 
 extern void pgstat_report_vacuum(Oid tableoid, bool shared,
 								 PgStat_Counter livetuples, PgStat_Counter deadtuples,
+								 PgStat_Counter *freqs, TransactionId *bounds,
 								 TimestampTz starttime);
 extern void pgstat_report_analyze(Relation rel,
 								  PgStat_Counter livetuples, PgStat_Counter deadtuples,
@@ -716,7 +742,11 @@ extern void pgstat_count_heap_insert(Relation rel, PgStat_Counter n);
 extern void pgstat_count_heap_update(Relation rel, bool hot, bool newpage);
 extern void pgstat_count_heap_delete(Relation rel);
 extern void pgstat_count_truncate(Relation rel);
-extern void pgstat_update_heap_dead_tuples(Relation rel, int delta);
+extern void pgstat_update_heap_dead_tuples(Relation rel, int delta, TransactionId low_xid, TransactionId high_xid);
+extern void pgstat_update_main_xid_histogram(PgStat_StatTabEntry *tabentry, PgStat_Counter *src_freqs, TransactionId *src_bounds);
+extern void balance_xid_histogram(PgStat_Counter *freqs, TransactionId *bounds);
+extern void update_xid_histogram(PgStat_Counter *freqs, TransactionId *bounds, PgStat_Counter delta_freq, TransactionId low_xid, TransactionId high_xid);
+
 
 extern void pgstat_twophase_postcommit(TransactionId xid, uint16 info,
 									   void *recdata, uint32 len);

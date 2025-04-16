@@ -193,7 +193,9 @@ void
 heap_page_prune_opt(Relation relation, Buffer buffer)
 {
 	Page		page = BufferGetPage(buffer);
-	TransactionId prune_xid;
+	TransactionId prune_xid,
+				low_xid,
+				high_xid;
 	GlobalVisState *vistest;
 	Size		minfree;
 
@@ -211,6 +213,7 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
 	 * (i.e. no updates/deletes left potentially dead tuples around).
 	 */
 	prune_xid = ((PageHeader) page)->pd_prune_xid;
+	low_xid = prune_xid;
 	if (!TransactionIdIsValid(prune_xid))
 		return;
 
@@ -277,9 +280,14 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
 			 * tracks ndeleted, since it will set the same LP_DEAD items to
 			 * LP_UNUSED separately.
 			 */
+
+			high_xid = ((PageHeader) page)->pd_prune_xid;
+			/* not sure we need high_xid */
 			if (presult.ndeleted > presult.nnewlpdead)
 				pgstat_update_heap_dead_tuples(relation,
-											   presult.ndeleted - presult.nnewlpdead);
+											   presult.ndeleted - presult.nnewlpdead,
+											   low_xid,
+											   high_xid);
 		}
 
 		/* And release buffer lock */

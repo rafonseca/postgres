@@ -209,6 +209,7 @@ pgstat_drop_relation(Relation rel)
 void
 pgstat_report_vacuum(Oid tableoid, bool shared,
 					 PgStat_Counter livetuples, PgStat_Counter deadtuples,
+					 PgStat_Counter *freqs, TransactionId *bounds,
 					 TimestampTz starttime)
 {
 	PgStat_EntryRef *entry_ref;
@@ -259,6 +260,8 @@ pgstat_report_vacuum(Oid tableoid, bool shared,
 		tabentry->vacuum_count++;
 		tabentry->total_vacuum_time += elapsedtime;
 	}
+
+	pgstat_update_main_xid_histogram(tabentry, freqs, bounds);
 
 	pgstat_unlock_entry(entry_ref);
 
@@ -442,6 +445,55 @@ pgstat_count_truncate(Relation rel)
 }
 
 /*
+ * Auxiliary function to update a generic xid histogram. The histogram
+ * represented by freqs and bounds is updated in place with the values
+ * delta_freq and either low_xid or high_xid. For delta_freq negative, low_xid
+ * is used; for delta_freq positive, high_xid is used.
+ */
+void
+update_xid_histogram(PgStat_Counter *freqs, TransactionId *bounds, PgStat_Counter delta_freq, TransactionId low_xid, TransactionId high_xid)
+{
+	int			bin;
+
+	if (delta_freq == 0)
+		return;
+
+	/* find suitable bin */
+
+	/*
+	 * when removing dead tuples, we decrease the counter of the smallest bin
+	 * that overlaps the range [low_xid,high_xid]. in practice, we don't need
+	 * to consider high_xid.
+	 */
+	if (delta_freq < 0)
+		for (bin = 0; bin < DEAD_TUPLES_HIST_SIZE - 1; bin++)
+			if (bounds[bin] != InvalidTransactionId && low_xid <= bounds[bin])
+				break;
+
+	/*
+	 * when adding dead tuples, we increase the counter of the highest bin
+	 * that overlaps the range. in practice, we don't need to consider
+	 * low_xid.
+	 */
+	if (delta_freq > 0)
+		for (bin = DEAD_TUPLES_HIST_SIZE - 1; bin > 0; bin--)
+			if (bounds[bin] == InvalidTransactionId || high_xid > bounds[bin - 1])
+				break;
+
+	freqs[bin] += delta_freq;
+
+	/* if it is the highest bin, update bounds accordingly */
+	if (bin == DEAD_TUPLES_HIST_SIZE - 1)
+	{
+		bounds[bin] = Max(high_xid, bounds[bin]);
+		if (bounds[bin - 1] == InvalidTransactionId)
+			/* Only for partially fulfilled histograms */
+			bounds[bin - 1] = low_xid;
+	}
+}
+
+
+/*
  * update dead-tuples count
  *
  * The semantics of this are that we are reporting the nontransactional
@@ -450,15 +502,112 @@ pgstat_count_truncate(Relation rel)
  * counter, not into transactional state.
  */
 void
-pgstat_update_heap_dead_tuples(Relation rel, int delta)
+pgstat_update_heap_dead_tuples(Relation rel, int delta, TransactionId low_xid, TransactionId high_xid)
 {
 	if (pgstat_should_count_relation(rel))
 	{
 		PgStat_TableStatus *pgstat_info = rel->pgstat_info;
 
 		pgstat_info->counts.delta_dead_tuples -= delta;
+		update_xid_histogram(pgstat_info->counts.dead_tuples_xid_freqs,
+							 pgstat_info->counts.dead_tuples_xid_bounds,
+							 -delta,
+							 low_xid,
+							 high_xid
+			);
 	}
 }
+
+
+
+/*
+ * This function updates dead_tuples_xid histogram of respective table in
+ * shared PgStat_StatTabEntry using information from auxiliary histogram.
+ */
+void
+pgstat_update_main_xid_histogram(PgStat_StatTabEntry *tabentry, PgStat_Counter *src_freqs, TransactionId *src_bounds)
+{
+	PgStat_Counter *freqs = tabentry->dead_tuples_xid_freq;
+	TransactionId *bounds = tabentry->dead_tuples_xid_bounds;
+	int			bin;
+	PgStat_Counter delta_freq;
+	TransactionId upper_xid;
+	TransactionId lower_xid = InvalidTransactionId;
+
+	for (bin = 0; bin < DEAD_TUPLES_HIST_SIZE; bin++)
+	{
+		delta_freq = src_freqs[bin];
+		upper_xid = src_bounds[bin];
+
+		if (upper_xid == InvalidTransactionId && bin < DEAD_TUPLES_HIST_SIZE - 1)
+			/* handle partially filled histograms */
+			continue;
+
+		update_xid_histogram(freqs, bounds, delta_freq, lower_xid, upper_xid);
+		lower_xid = upper_xid;
+	}
+
+	balance_xid_histogram(freqs, bounds);
+	/* TODO remove negative values */
+}
+
+
+/*
+ * If conditions are satisfied, merge two adjacent *closed* bins and shift
+ * data to create a new *open* bin. Then, previous *open* bin becomes a
+ * *closed* one. We perform the balance operation when the freqs of the *open*
+ * bin is higher than the combined freqs of a pair of adjacent *closed*
+ * bins. The merged bin has the sum of freqs and the higher upper bound of the
+ * pair. If a histogram is not balanced often enough, the open bin will have a
+ * larger width. In this case, while we do loose granularity, the semantics of
+ * the upper bounds is not affected. If the histogram is never balanced, it
+ * behaves like a pair of (delta_dead_tuples,xid), keeping the sum of
+ * delta_dead_tuples and the max xid.
+ */
+/*  TODO: adapt to negative values */
+void
+balance_xid_histogram(PgStat_Counter *freqs, TransactionId *bounds)
+{
+	PgStat_Counter open_bin_freq = freqs[DEAD_TUPLES_HIST_SIZE - 1];
+	PgStat_Counter combined_bins_freq;
+	int			bin;
+	PgStat_Counter smallest_freq;
+	int			smallest_bin;
+
+	/*
+	 * from higher to lower, find first pair for which combined freqs are
+	 * lower then the highest bin (open bin).
+	 *
+	 * for a more balanced histogram, we should search until the end to find
+	 * the smallest pair. we could stop at the first to speed up.
+	 */
+	smallest_freq = open_bin_freq;
+	smallest_bin = 0;
+	//invalid bin pair
+		for (bin = DEAD_TUPLES_HIST_SIZE - 2; bin > 0; bin--)
+	{
+		combined_bins_freq = freqs[bin] + freqs[bin - 1];
+		if (smallest_freq > combined_bins_freq)
+		{
+			smallest_freq = combined_bins_freq;
+			smallest_bin = bin;
+		}
+	}
+	bin = smallest_bin;
+	if (bin > 0)
+		/* then merge and shift */
+	{
+		freqs[bin - 1] = combined_bins_freq;
+		bounds[bin - 1] = bounds[bin];
+		for (; bin < DEAD_TUPLES_HIST_SIZE - 1; bin++)
+		{
+			freqs[bin] = freqs[bin + 1];
+			bounds[bin] = bounds[bin + 1];
+		}
+		freqs[bin] = 0;
+	}
+}
+
 
 /*
  * Support function for the SQL-callable pgstat* functions. Returns
@@ -555,6 +704,7 @@ AtEOXact_PgStat_Relations(PgStat_SubXactStatus *xact_state, bool isCommit)
 	for (trans = xact_state->first; trans != NULL; trans = trans->next)
 	{
 		PgStat_TableStatus *tabstat;
+		PgStat_Counter dead_tuples;
 
 		Assert(trans->nest_level == 1);
 		Assert(trans->upper == NULL);
@@ -580,8 +730,9 @@ AtEOXact_PgStat_Relations(PgStat_SubXactStatus *xact_state, bool isCommit)
 			tabstat->counts.delta_live_tuples +=
 				trans->tuples_inserted - trans->tuples_deleted;
 			/* update and delete each create a dead tuple */
-			tabstat->counts.delta_dead_tuples +=
-				trans->tuples_updated + trans->tuples_deleted;
+			dead_tuples = trans->tuples_updated + trans->tuples_deleted;
+			tabstat->counts.delta_dead_tuples += dead_tuples;
+
 			/* insert, update, delete each count as one change event */
 			tabstat->counts.changed_tuples +=
 				trans->tuples_inserted + trans->tuples_updated +
@@ -590,10 +741,45 @@ AtEOXact_PgStat_Relations(PgStat_SubXactStatus *xact_state, bool isCommit)
 		else
 		{
 			/* inserted tuples are dead, deleted tuples are unaffected */
-			tabstat->counts.delta_dead_tuples +=
-				trans->tuples_inserted + trans->tuples_updated;
+			dead_tuples = trans->tuples_inserted + trans->tuples_updated;
+			tabstat->counts.delta_dead_tuples += dead_tuples;
+
 			/* an aborted xact generates no changed_tuple events */
 		}
+
+		/*
+		 * use local dead_tuples instead of tabstat->count.delta_dead_tuples
+		 * because the it has counted eventually removed dead tuples, and we
+		 * count them separately for the purposes of xid histograms.
+		 */
+		if (dead_tuples > 0)
+		{
+			/*
+			 * inside a transaction, dead tuples can have different xmax, one
+			 * for every command. we do not support that much granularity.
+			 * instead we use a single xid per transaction. however, if we
+			 * used the transaction proper xid, the histogram would loose
+			 * consistency because xid of dead tuples would be higher than its
+			 * respective bin upper bound. instead, we use the maximum child
+			 * xid of the transaction, which is a proper upper bound on its
+			 * dead tuples xmin values.
+			 */
+
+			TransactionId xid = GetCurrentTransactionMaxChildId();
+
+			if (xid == InvalidTransactionId)
+				xid = GetCurrentTransactionIdIfAny();
+
+			Assert(dead_tuples >= 0);
+			update_xid_histogram(tabstat->counts.dead_tuples_xid_freqs,
+								 tabstat->counts.dead_tuples_xid_bounds,
+								 dead_tuples,
+								 InvalidTransactionId,
+								 xid);
+			ereport(LOG, errmsg("updating xid_hist in pgstat_relation.c"));
+
+		}
+
 		tabstat->trans = NULL;
 	}
 }
@@ -608,6 +794,7 @@ AtEOXact_PgStat_Relations(PgStat_SubXactStatus *xact_state, bool isCommit)
 void
 AtEOSubXact_PgStat_Relations(PgStat_SubXactStatus *xact_state, bool isCommit, int nestDepth)
 {
+	/* TODO: handle subtransactions stats */
 	PgStat_TableXactStatus *trans;
 	PgStat_TableXactStatus *next_trans;
 
@@ -863,10 +1050,13 @@ pgstat_relation_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
 		tabentry->live_tuples = 0;
 		tabentry->dead_tuples = 0;
 		tabentry->ins_since_vacuum = 0;
+		MemSet(tabentry->dead_tuples_xid_freq, 0, DEAD_TUPLES_HIST_SIZE * sizeof(PgStat_Counter));
+		MemSet(tabentry->dead_tuples_xid_bounds, 0, DEAD_TUPLES_HIST_SIZE * sizeof(TransactionId));
 	}
 
 	tabentry->live_tuples += lstats->counts.delta_live_tuples;
 	tabentry->dead_tuples += lstats->counts.delta_dead_tuples;
+	pgstat_update_main_xid_histogram(tabentry, lstats->counts.dead_tuples_xid_freqs, lstats->counts.dead_tuples_xid_bounds);
 	tabentry->mod_since_analyze += lstats->counts.changed_tuples;
 
 	/*

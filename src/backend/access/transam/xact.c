@@ -460,6 +460,24 @@ GetCurrentTransactionId(void)
 	return XidFromFullTransactionId(s->fullTransactionId);
 }
 
+
+/*
+ *	GetCurrentTransactionMaxChildId
+ *
+ * This will return the highest XID among current transaction childs XIDs. It
+ * returns InvalidTransactionId if current transaction has no childs.
+ */
+TransactionId
+GetCurrentTransactionMaxChildId(void)
+{
+	TransactionState s = CurrentTransactionState;
+
+	if (s->nChildXids == 0)
+		return InvalidTransactionId;
+	else
+		return s->childXids[s->nChildXids - 1];
+}
+
 /*
  *	GetCurrentTransactionIdIfAny
  *
