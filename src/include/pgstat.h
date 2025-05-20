@@ -111,6 +111,21 @@ typedef struct PgStat_BackendSubEntry
 	PgStat_Counter conflict_count[CONFLICT_NUM_TYPES];
 } PgStat_BackendSubEntry;
 
+#define PRUNE_XID_HIST_NBINS 5
+
+typedef struct PruneXidHistogram
+{
+	PgStat_Counter freqs[PRUNE_XID_HIST_NBINS];
+	TransactionId bounds[PRUNE_XID_HIST_NBINS];
+} PruneXidHistogram;
+
+typedef struct PruneXidHistogramTransient
+{
+	PgStat_Counter freqs[PRUNE_XID_HIST_NBINS];
+	PgStat_Counter neg_freq;
+	TransactionId bounds[PRUNE_XID_HIST_NBINS];
+} PruneXidHistogramTransient;
+
 /* ----------
  * PgStat_TableCounts			The actual per-table counts kept by a backend
  *
@@ -153,6 +168,8 @@ typedef struct PgStat_TableCounts
 
 	PgStat_Counter blocks_fetched;
 	PgStat_Counter blocks_hit;
+
+	PruneXidHistogramTransient prune_xid_hist;
 } PgStat_TableCounts;
 
 /* ----------
@@ -211,7 +228,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCB7
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCB8
 
 typedef struct PgStat_ArchiverStats
 {
@@ -436,6 +453,8 @@ typedef struct PgStat_StatTabEntry
 	PgStat_Counter dead_tuples;
 	PgStat_Counter mod_since_analyze;
 	PgStat_Counter ins_since_vacuum;
+
+	PruneXidHistogram prune_xid_hist;
 
 	PgStat_Counter blocks_fetched;
 	PgStat_Counter blocks_hit;

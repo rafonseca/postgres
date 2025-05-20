@@ -2334,6 +2334,8 @@ PruneFreezeResult
 PruneReason
 PruneState
 PruneStepResult
+PruneXidHistogram
+PruneXidHistogramTransient
 PsqlScanCallbacks
 PsqlScanQuoteType
 PsqlScanResult
