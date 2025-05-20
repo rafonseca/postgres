@@ -2748,6 +2748,8 @@ heap_delete(Relation relation, ItemPointer tid,
 {
 	TM_Result	result;
 	TransactionId xid = GetCurrentTransactionId();
+	TransactionId old_prune_xid;
+	bool		prune_xid_changed = false;
 	ItemId		lp;
 	HeapTupleData tp;
 	Page		page;
@@ -3015,7 +3017,7 @@ l1:
 	 * the subsequent page pruning will be a no-op and the hint will be
 	 * cleared.
 	 */
-	PageSetPrunable(page, xid);
+	PageSetPrunableReporting(page, xid, old_prune_xid, prune_xid_changed);
 
 	if (PageIsAllVisible(page))
 	{
@@ -3148,6 +3150,9 @@ l1:
 
 	pgstat_count_heap_delete(relation);
 
+	if (prune_xid_changed)
+		pgstat_update_local_prune_xid_histogram(relation, old_prune_xid, xid);
+
 	if (old_key_tuple != NULL && old_key_copied)
 		heap_freetuple(old_key_tuple);
 
@@ -3216,6 +3221,8 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 {
 	TM_Result	result;
 	TransactionId xid = GetCurrentTransactionId();
+	TransactionId old_prune_xid;
+	bool		prune_xid_changed = false;
 	Bitmapset  *hot_attrs;
 	Bitmapset  *sum_attrs;
 	Bitmapset  *key_attrs;
@@ -4029,7 +4036,7 @@ l2:
 	 * not to optimize for aborts.  Note that heap_xlog_update must be kept in
 	 * sync if this decision changes.
 	 */
-	PageSetPrunable(page, xid);
+	PageSetPrunableReporting(page, xid, old_prune_xid, prune_xid_changed);
 
 	if (use_hot_update)
 	{
@@ -4143,6 +4150,9 @@ l2:
 		UnlockTupleTuplock(relation, &(oldtup.t_self), *lockmode);
 
 	pgstat_count_heap_update(relation, use_hot_update, newbuf != buffer);
+
+	if (prune_xid_changed)
+		pgstat_update_local_prune_xid_histogram(relation, old_prune_xid, xid);
 
 	/*
 	 * If heaptup is a private copy, release it.  Don't forget to copy t_self
@@ -6139,6 +6149,9 @@ void
 heap_abort_speculative(Relation relation, ItemPointer tid)
 {
 	TransactionId xid = GetCurrentTransactionId();
+	TransactionId prune_xid;
+	TransactionId old_prune_xid;
+	bool		prune_xid_changed = false;
 	ItemId		lp;
 	HeapTupleData tp;
 	Page		page;
@@ -6198,13 +6211,12 @@ heap_abort_speculative(Relation relation, ItemPointer tid)
 	Assert(TransactionIdIsValid(TransactionXmin));
 	{
 		TransactionId relfrozenxid = relation->rd_rel->relfrozenxid;
-		TransactionId prune_xid;
 
 		if (TransactionIdPrecedes(TransactionXmin, relfrozenxid))
 			prune_xid = relfrozenxid;
 		else
 			prune_xid = TransactionXmin;
-		PageSetPrunable(page, prune_xid);
+		PageSetPrunableReporting(page, prune_xid, old_prune_xid, prune_xid_changed);
 	}
 
 	/* store transaction information of xact deleting the tuple */
@@ -6271,6 +6283,8 @@ heap_abort_speculative(Relation relation, ItemPointer tid)
 
 	/* count deletion, as we counted the insertion too */
 	pgstat_count_heap_delete(relation);
+	if (prune_xid_changed)
+		pgstat_update_local_prune_xid_histogram(relation, old_prune_xid, prune_xid);
 }
 
 /*

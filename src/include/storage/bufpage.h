@@ -452,6 +452,18 @@ do { \
 		TransactionIdPrecedes(xid, ((PageHeader) (page))->pd_prune_xid)) \
 		((PageHeader) (page))->pd_prune_xid = (xid); \
 } while (0)
+#define PageSetPrunableReporting(page, xid, old_xid, changed)	\
+do { \
+	Assert(TransactionIdIsNormal(xid)); \
+	if (!TransactionIdIsValid(((PageHeader) (page))->pd_prune_xid) || \
+		TransactionIdPrecedes(xid, ((PageHeader) (page))->pd_prune_xid)) \
+	    { \
+            old_xid = ((PageHeader) (page))->pd_prune_xid; \
+            ((PageHeader) (page))->pd_prune_xid = (xid); \
+		    changed = true; \
+        } \
+} while (0)
+
 #define PageClearPrunable(page) \
 	(((PageHeader) (page))->pd_prune_xid = InvalidTransactionId)
 
