@@ -3151,7 +3151,7 @@ l1:
 	pgstat_count_heap_delete(relation);
 
 	if (prune_xid_changed)
-		pgstat_update_local_prune_xid_histogram(relation, old_prune_xid, xid);
+		pgstat_update_relation_prune_xid_histogram(relation, old_prune_xid, xid);
 
 	if (old_key_tuple != NULL && old_key_copied)
 		heap_freetuple(old_key_tuple);
@@ -4152,7 +4152,7 @@ l2:
 	pgstat_count_heap_update(relation, use_hot_update, newbuf != buffer);
 
 	if (prune_xid_changed)
-		pgstat_update_local_prune_xid_histogram(relation, old_prune_xid, xid);
+		pgstat_update_relation_prune_xid_histogram(relation, old_prune_xid, xid);
 
 	/*
 	 * If heaptup is a private copy, release it.  Don't forget to copy t_self
@@ -6284,7 +6284,7 @@ heap_abort_speculative(Relation relation, ItemPointer tid)
 	/* count deletion, as we counted the insertion too */
 	pgstat_count_heap_delete(relation);
 	if (prune_xid_changed)
-		pgstat_update_local_prune_xid_histogram(relation, old_prune_xid, prune_xid);
+		pgstat_update_relation_prune_xid_histogram(relation, old_prune_xid, prune_xid);
 }
 
 /*

@@ -285,6 +285,11 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
 		/* And release buffer lock */
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
+		if (prune_xid != ((PageHeader) page)->pd_prune_xid)
+			pgstat_update_relation_prune_xid_histogram(relation,
+													   prune_xid,
+													   ((PageHeader) page)->pd_prune_xid);
+
 		/*
 		 * We avoid reuse of any free space created on the page by unrelated
 		 * UPDATEs/INSERTs by opting to not update the FSM at this point.  The
