@@ -940,6 +940,7 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 						 Max(vacrel->new_live_tuples, 0),
 						 vacrel->recently_dead_tuples +
 						 vacrel->missed_dead_tuples,
+						 &vacrel->prune_xid_hist,
 						 starttime);
 	pgstat_progress_end_command();
 

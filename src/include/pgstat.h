@@ -679,7 +679,7 @@ extern void pgstat_unlink_relation(Relation rel);
 
 extern void pgstat_report_vacuum(Oid tableoid, bool shared,
 								 PgStat_Counter livetuples, PgStat_Counter deadtuples,
-								 TimestampTz starttime);
+								 const PruneXidHistogramTransient *prune_xid_hist, TimestampTz starttime);
 extern void pgstat_report_analyze(Relation rel,
 								  PgStat_Counter livetuples, PgStat_Counter deadtuples,
 								  bool resetcounter, TimestampTz starttime);

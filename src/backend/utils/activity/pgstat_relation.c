@@ -210,7 +210,7 @@ pgstat_drop_relation(Relation rel)
 void
 pgstat_report_vacuum(Oid tableoid, bool shared,
 					 PgStat_Counter livetuples, PgStat_Counter deadtuples,
-					 TimestampTz starttime)
+					 const PruneXidHistogramTransient *prune_xid_hist, TimestampTz starttime)
 {
 	PgStat_EntryRef *entry_ref;
 	PgStatShared_Relation *shtabentry;
@@ -260,6 +260,8 @@ pgstat_report_vacuum(Oid tableoid, bool shared,
 		tabentry->vacuum_count++;
 		tabentry->total_vacuum_time += elapsedtime;
 	}
+
+	pgstat_update_shared_prune_xid_histogram(tabentry, prune_xid_hist);
 
 	pgstat_unlock_entry(entry_ref);
 
@@ -1119,6 +1121,7 @@ pgstat_relation_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
 
 	tabentry->live_tuples += lstats->counts.delta_live_tuples;
 	tabentry->dead_tuples += lstats->counts.delta_dead_tuples;
+	pgstat_update_shared_prune_xid_histogram(tabentry, &lstats->counts.prune_xid_hist);
 	tabentry->mod_since_analyze += lstats->counts.changed_tuples;
 
 	/*
