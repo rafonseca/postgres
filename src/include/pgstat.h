@@ -737,6 +737,12 @@ extern void pgstat_count_heap_delete(Relation rel);
 extern void pgstat_count_truncate(Relation rel);
 extern void pgstat_update_heap_dead_tuples(Relation rel, int delta);
 
+extern const PgStat_Counter *pgstat_get_prune_xid_histogram_freqs(PgStat_StatTabEntry *tabentry);
+extern const TransactionId *pgstat_get_prune_xid_histogram_bounds(PgStat_StatTabEntry *tabentry);
+extern void pgstat_update_transient_prune_xid_histogram(PruneXidHistogramTransient *hist, TransactionId old_xid, TransactionId new_xid);
+extern void pgstat_update_relation_prune_xid_histogram(Relation rel, TransactionId old_xid, TransactionId new_xid);
+extern void pgstat_update_shared_prune_xid_histogram(PgStat_StatTabEntry *tabentry, const PruneXidHistogramTransient *source);
+
 extern void pgstat_twophase_postcommit(TransactionId xid, uint16 info,
 									   void *recdata, uint32 len);
 extern void pgstat_twophase_postabort(TransactionId xid, uint16 info,
