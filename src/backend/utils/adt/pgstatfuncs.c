@@ -29,6 +29,7 @@
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/acl.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/timestamp.h"
 
@@ -69,6 +70,53 @@ PG_STAT_GET_RELENTRY_INT64(blocks_hit)
 
 /* pg_stat_get_dead_tuples */
 PG_STAT_GET_RELENTRY_INT64(dead_tuples)
+
+/* pg_stat_get_prune_xid_freqs */
+Datum
+pg_stat_get_prune_xid_freqs(FunctionCallInfo fcinfo)
+{
+	Oid			relid = DatumGetObjectId((fcinfo->args[0].value));
+	Datum	   *result;
+	PgStat_StatTabEntry *tabentry;
+	int			i;
+	const PgStat_Counter *freqs;
+
+	tabentry = pgstat_fetch_stat_tabentry(relid);
+	if (tabentry == ((void *) 0))
+		/* OID not found */
+		PG_RETURN_ARRAYTYPE_P(construct_empty_array(XIDOID));
+
+	freqs = pgstat_get_prune_xid_histogram_freqs(tabentry);
+	result = palloc((PRUNE_XID_HIST_NBINS) * sizeof(Datum));
+	for (i = 0; i < PRUNE_XID_HIST_NBINS; i++)
+		result[i] = Int64GetDatum(freqs[i]);
+
+	PG_RETURN_ARRAYTYPE_P(construct_array_builtin(result, PRUNE_XID_HIST_NBINS, XIDOID));
+}
+
+/* pg_stat_get_prune_xid_bounds */
+Datum
+pg_stat_get_prune_xid_bounds(FunctionCallInfo fcinfo)
+{
+	Oid			relid = DatumGetObjectId((fcinfo->args[0].value));
+	Datum	   *result;
+	PgStat_StatTabEntry *tabentry;
+	int			i;
+	const TransactionId *bounds;
+
+	tabentry = pgstat_fetch_stat_tabentry(relid);
+	if (tabentry == ((void *) 0))
+		/* OID not found */
+		PG_RETURN_ARRAYTYPE_P(construct_empty_array(INT8OID));
+
+	bounds = pgstat_get_prune_xid_histogram_bounds(tabentry);
+	result = palloc(PRUNE_XID_HIST_NBINS * sizeof(Datum));
+	for (i = 0; i < PRUNE_XID_HIST_NBINS; i++)
+		result[i] = TransactionIdGetDatum(bounds[i]);
+
+	PG_RETURN_ARRAYTYPE_P(construct_array_builtin(result, PRUNE_XID_HIST_NBINS, INT8OID));
+}
+
 
 /* pg_stat_get_ins_since_vacuum */
 PG_STAT_GET_RELENTRY_INT64(ins_since_vacuum)
