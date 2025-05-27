@@ -1178,6 +1178,7 @@ pgstat_prep_relation_pending(Oid rel_id, bool isshared)
 	pending = entry_ref->pending;
 	pending->id = rel_id;
 	pending->shared = isshared;
+	pgstat_init_local_prune_xid_histogram(pending, entry_ref);
 
 	return pending;
 }
