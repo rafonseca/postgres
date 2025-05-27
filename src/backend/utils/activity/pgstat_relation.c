@@ -1114,6 +1114,7 @@ pgstat_relation_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
 		tabentry->live_tuples = 0;
 		tabentry->dead_tuples = 0;
 		tabentry->ins_since_vacuum = 0;
+		MemSet(&tabentry->prune_xid_hist, 0, sizeof(PruneXidHistogram));
 	}
 
 	tabentry->live_tuples += lstats->counts.delta_live_tuples;
