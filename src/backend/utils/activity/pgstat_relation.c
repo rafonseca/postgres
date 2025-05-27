@@ -20,6 +20,7 @@
 #include "access/twophase_rmgr.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
+#include "storage/procarray.h"
 #include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
 #include "utils/rel.h"
@@ -459,6 +460,256 @@ pgstat_update_heap_dead_tuples(Relation rel, int delta)
 		pgstat_info->counts.delta_dead_tuples -= delta;
 	}
 }
+
+
+static int
+find_last_containing_bin(TransactionId *bounds, TransactionId xid)
+{
+	int			bin;
+
+	for (bin = PRUNE_XID_HIST_NBINS - 1; bin > 0; bin--)
+		if (bounds[bin - 1] == InvalidTransactionId || xid > bounds[bin - 1])
+			break;
+	return bin;
+}
+
+static int
+find_first_containing_bin(TransactionId *bounds, TransactionId xid)
+{
+	int			bin;
+
+	for (bin = 0; bin < PRUNE_XID_HIST_NBINS - 1; bin++)
+		if (bounds[bin] != InvalidTransactionId && xid < bounds[bin])
+			break;
+	return bin;
+}
+
+
+static void
+hist_prune_xid_update(PruneXidHistogramTransient *hist, TransactionId xid, PgStat_Counter delta)
+{
+	int			bin;
+
+	if (xid == InvalidTransactionId)
+		return;
+
+	bin = find_last_containing_bin(hist->bounds, xid);
+
+	if (bin == PRUNE_XID_HIST_NBINS - 1)
+	{
+		/* handle open bin */
+		if (delta > 0)
+			hist->freqs[bin] += delta;
+		else
+			hist->neg_freq += delta;
+		hist->bounds[bin] = Max(hist->bounds[bin], xid);
+	}
+	else
+	{
+		hist->freqs[bin] += delta;
+	}
+}
+
+
+/*
+ * At certain moments, we know that freqs cannot be negative. Then, we can
+ * rectify the histogram by moving the negative counts forward. Both
+ * histograms, before and after this operation, respect the lower bound
+ * guarantees. But the resultant is a tighter bound.
+ */
+static void
+hist_prune_xid_rectify(PruneXidHistogram *hist)
+{
+	PgStat_Counter excess = 0;
+	int			bin;
+
+	for (bin = 0; bin < PRUNE_XID_HIST_NBINS - 1; bin++)
+	{
+		hist->freqs[bin] += excess;
+		excess = 0;
+
+		if (hist->freqs[bin] < 0)
+		{
+			excess = hist->freqs[bin];
+			hist->freqs[bin] = 0;
+		}
+	}
+	hist->freqs[bin] += excess;
+}
+
+static void
+hist_shift_left(PruneXidHistogram *hist, int from_bin)
+{
+	PgStat_Counter *freqs = hist->freqs;
+	TransactionId *bounds = hist->bounds;
+	int			bin;
+
+	Assert(from_bin >= 0);
+
+	for (bin = from_bin; bin < PRUNE_XID_HIST_NBINS - 1; bin++)
+	{
+		bounds[bin] = bounds[bin + 1];
+		freqs[bin] = freqs[bin + 1];
+	}
+	bounds[bin] = 0;
+	freqs[bin] = 0;
+	return;
+}
+
+/*
+ * Merge intermediate adjacent bins in order to make space for a new open bin.
+ */
+static void
+hist_prune_xid_balance(PruneXidHistogram *hist)
+{
+	PgStat_Counter *freqs = hist->freqs;
+	TransactionId *bounds = hist->bounds;
+	int			bin;
+
+	/* do nothing if open bin is empty */
+	if (freqs[PRUNE_XID_HIST_NBINS - 1] == 0)
+		return;
+	if (freqs[PRUNE_XID_HIST_NBINS - 1] == freqs[PRUNE_XID_HIST_NBINS - 2])
+		return;
+
+	/* if histogram is partially fulfilled, just shift bins */
+	if (bounds[0] == 0)
+	{
+		hist_shift_left(hist, 0);
+		return;
+	}
+
+	/*
+	 * if second bin upper bound xid is smaller than oldest non removable xid,
+	 * merge first two bins
+	 */
+	if (freqs[1] < GetOldestNonRemovableTransactionId(NULL))
+	{
+		freqs[0] += freqs[1];
+		bounds[0] = bounds[1];
+		hist_shift_left(hist, 1);
+		return;
+	}
+
+	/*
+	 * if open bin is too "big", merge two "small" adjacent bins.
+	 */
+	{
+		PgStat_Counter open_bin_freq = freqs[PRUNE_XID_HIST_NBINS - 1];
+		PgStat_Counter smallest_pair_freq = 0;
+		int			smallest_bin = 0;
+
+		for (bin = 0; bin < PRUNE_XID_HIST_NBINS - 1; bin++)
+			if (freqs[bin] + freqs[bin + 1] > smallest_pair_freq)
+			{
+				smallest_pair_freq = freqs[bin] + freqs[bin + 1];
+				smallest_bin = bin;
+			}
+		if (open_bin_freq > smallest_pair_freq)
+		{
+			freqs[smallest_bin] += freqs[smallest_bin + 1];
+			bounds[smallest_bin] = bounds[smallest_bin + 1];
+			hist_shift_left(hist, smallest_bin + 1);
+		}
+		return;
+	}
+}
+
+/* update transient histogram */
+void
+pgstat_update_transient_prune_xid_histogram(PruneXidHistogramTransient *hist, TransactionId old_xid, TransactionId new_xid)
+{
+	if (old_xid == new_xid)
+		return;
+	hist_prune_xid_update(hist, old_xid, -1);
+	hist_prune_xid_update(hist, new_xid, 1);
+}
+
+/* update per-backend prune_xid_histogram */
+void
+pgstat_update_relation_prune_xid_histogram(Relation rel, TransactionId old_xid, TransactionId new_xid)
+{
+	if (pgstat_should_count_relation(rel))
+	{
+		PgStat_TableStatus *pgstat_info = rel->pgstat_info;
+		PruneXidHistogramTransient *hist = &pgstat_info->counts.prune_xid_hist;
+
+		Assert(old_xid != new_xid);
+		hist_prune_xid_update(hist, old_xid, -1);
+		hist_prune_xid_update(hist, new_xid, 1);
+
+	}
+}
+
+
+/*
+ * This function updates prune_xid histogram of respective table in
+ * shared PgStat_StatTabEntry using information from auxiliary histogram.
+ */
+void
+pgstat_update_shared_prune_xid_histogram(PgStat_StatTabEntry *tabentry, const PruneXidHistogramTransient *source)
+{
+	int			bin_source,
+				bin_target;
+	PgStat_Counter delta;
+	TransactionId xid;
+	PruneXidHistogram *target = &tabentry->prune_xid_hist;
+
+	/* process main, positive, freqs */
+	for (bin_source = 0; bin_source < PRUNE_XID_HIST_NBINS; bin_source++)
+	{
+		delta = source->freqs[bin_source];
+		xid = source->bounds[bin_source];
+
+		if (xid == InvalidTransactionId || delta == 0)
+			/* skip bins in partially filled histograms */
+			continue;
+
+		bin_target = find_last_containing_bin(target->bounds, xid);
+		target->freqs[bin_target] += delta;
+
+		if (bin_target == PRUNE_XID_HIST_NBINS - 1)
+			target->bounds[bin_target] = Max(target->bounds[bin_target], xid);
+	}
+
+	/* process negative freq */
+	xid = source->bounds[PRUNE_XID_HIST_NBINS - 2] + 1;
+	bin_target = find_first_containing_bin(target->bounds, xid);
+	target->freqs[bin_target] += source->neg_freq;
+
+	/* finally, balance histogram */
+	hist_prune_xid_balance(target);
+	hist_prune_xid_rectify(target);
+}
+
+static void
+pgstat_init_local_prune_xid_histogram(PgStat_TableStatus *lstats, PgStat_EntryRef *entry_ref)
+{
+	int			bin;
+	PgStatShared_Relation *shtabstats;
+
+	shtabstats = (PgStatShared_Relation *) entry_ref->shared_stats;
+
+	for (bin = 0; bin < PRUNE_XID_HIST_NBINS; bin++)
+	{
+		lstats->counts.prune_xid_hist.bounds[bin] = shtabstats->stats.prune_xid_hist.bounds[bin];
+		lstats->counts.prune_xid_hist.freqs[bin] = 0;
+	}
+	lstats->counts.prune_xid_hist.neg_freq = 0;
+}
+
+const PgStat_Counter *
+pgstat_get_prune_xid_histogram_freqs(PgStat_StatTabEntry *tabentry)
+{
+	return tabentry->prune_xid_hist.freqs;
+}
+
+const TransactionId *
+pgstat_get_prune_xid_histogram_bounds(PgStat_StatTabEntry *tabentry)
+{
+	return tabentry->prune_xid_hist.bounds;
+}
+
 
 /*
  * Support function for the SQL-callable pgstat* functions. Returns
