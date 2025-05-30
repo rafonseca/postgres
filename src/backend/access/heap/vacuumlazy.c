@@ -1955,6 +1955,8 @@ lazy_scan_prune(LVRelState *vacrel,
 	Relation	rel = vacrel->rel;
 	PruneFreezeResult presult;
 	int			prune_options = 0;
+	TransactionId old_xid;
+	TransactionId new_xid;
 
 	Assert(BufferGetBlockNumber(buf) == blkno);
 
@@ -1977,10 +1979,12 @@ lazy_scan_prune(LVRelState *vacrel,
 	if (vacrel->nindexes == 0)
 		prune_options |= HEAP_PAGE_PRUNE_MARK_UNUSED_NOW;
 
+	old_xid = ((PageHeader) page)->pd_prune_xid;
 	heap_page_prune_and_freeze(rel, buf, vacrel->vistest, prune_options,
 							   &vacrel->cutoffs, &presult, PRUNE_VACUUM_SCAN,
 							   &vacrel->offnum,
 							   &vacrel->NewRelfrozenXid, &vacrel->NewRelminMxid);
+	new_xid = ((PageHeader) page)->pd_prune_xid;
 
 	Assert(MultiXactIdIsValid(vacrel->NewRelminMxid));
 	Assert(TransactionIdIsValid(vacrel->NewRelfrozenXid));
@@ -2048,6 +2052,8 @@ lazy_scan_prune(LVRelState *vacrel,
 	vacrel->lpdead_items += presult.lpdead_items;
 	vacrel->live_tuples += presult.live_tuples;
 	vacrel->recently_dead_tuples += presult.recently_dead_tuples;
+
+	pgstat_update_transient_prune_xid_histogram(&vacrel->prune_xid_hist, old_xid, new_xid);
 
 	/* Can't truncate this page */
 	if (presult.hastup)
