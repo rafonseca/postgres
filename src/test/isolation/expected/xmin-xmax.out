@@ -1,0 +1,20 @@
+Parsed test spec with 3 sessions
+
+starting permutation: begin_s1 insert_and_delete insert_when_possible increase_counter commit_s1
+step begin_s1: begin;
+step insert_and_delete: 
+    insert into t1 (values (1));
+    delete from t1;
+
+step insert_when_possible: 
+    insert into t1 (values (1));
+    select counter from t2;
+ <waiting ...>
+step increase_counter: update t2 set counter = counter + 1;
+step commit_s1: commit;
+step insert_when_possible: <... completed>
+counter
+-------
+      1
+(1 row)
+
