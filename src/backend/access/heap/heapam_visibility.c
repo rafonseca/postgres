@@ -751,6 +751,9 @@ HeapTupleSatisfiesDirty(HeapTuple htup, Snapshot snapshot,
 	snapshot->xmin = snapshot->xmax = InvalidTransactionId;
 	snapshot->speculativeToken = 0;
 
+	if (HeapTupleHeaderGetRawXmin(tuple)==HeapTupleHeaderGetRawXmax(tuple))
+		return false;
+
 	if (!HeapTupleHeaderXminCommitted(tuple))
 	{
 		if (HeapTupleHeaderXminInvalid(tuple))

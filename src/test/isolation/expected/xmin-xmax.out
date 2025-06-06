@@ -9,12 +9,11 @@ step insert_and_delete:
 step insert_when_possible: 
     insert into t1 (values (1));
     select counter from t2;
- <waiting ...>
-step increase_counter: update t2 set counter = counter + 1;
-step commit_s1: commit;
-step insert_when_possible: <... completed>
+
 counter
 -------
-      1
+      0
 (1 row)
 
+step increase_counter: update t2 set counter = counter + 1;
+step commit_s1: commit;
