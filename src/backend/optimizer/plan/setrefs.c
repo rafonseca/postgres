@@ -2631,6 +2631,14 @@ convert_combining_aggrefs(Node *node, void *context)
 		Aggref	   *child_agg;
 		Aggref	   *parent_agg;
 
+		/*
+		 * If this Aggref was already set up for partial aggregation (e.g.,
+		 * by partial aggregate pushdown into recursive CTEs), leave it
+		 * as-is.  Its args already reference the correct input columns.
+		 */
+		if (orig_agg->aggsplit != AGGSPLIT_SIMPLE)
+			return node;
+
 		/* Assert we've not chosen to partial-ize any unsupported cases */
 		Assert(orig_agg->aggorder == NIL);
 		Assert(orig_agg->aggdistinct == NIL);

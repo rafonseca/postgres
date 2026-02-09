@@ -213,6 +213,34 @@ typedef struct PlannerInfo PlannerInfo;
 #define HAVE_PLANNERINFO_TYPEDEF 1
 #endif
 
+/*
+ * PartialAggPushdownInfo
+ *
+ * Descriptor for pushing partial aggregation into a recursive CTE.
+ * Computed in SS_process_ctes() and consumed by generate_recursion_path().
+ * This is NOT a Node type (no NodeTag), so gen_node_support.pl ignores it.
+ */
+typedef struct PartialAggPushdownInfo
+{
+	/* 1-based CTE output column positions for GROUP BY keys */
+	List	   *groupColPositions;		/* int list */
+
+	/* SortGroupClause copies from outer query's groupClause */
+	List	   *groupSortGroupClauses;	/* list of SortGroupClause */
+
+	/* 1-based CTE output column positions being aggregated */
+	List	   *aggColPositions;		/* int list */
+
+	/* Copies of Aggref nodes from the outer query */
+	List	   *outerAggrefs;			/* list of Aggref* */
+
+	/* Transition types for each aggregate */
+	List	   *aggTransTypes;			/* OID list */
+
+	/* Combine function OIDs for each aggregate */
+	List	   *aggCombineFnOids;		/* OID list */
+} PartialAggPushdownInfo;
+
 struct PlannerInfo
 {
 	pg_node_attr(no_copy_equal, no_read, no_query_jumble)
@@ -557,6 +585,21 @@ struct PlannerInfo
 	int			wt_param_id;
 	/* a path for non-recursive term */
 	struct Path *non_recursive_path;
+
+	/*
+	 * Partial aggregate pushdown info for a recursive CTE being planned,
+	 * or NULL.  Set on the outer (parent) PlannerInfo before calling
+	 * subquery_planner for the CTE; generate_recursion_path accesses it
+	 * via root->parent_root->partial_agg_pushdown.
+	 */
+	struct PartialAggPushdownInfo *partial_agg_pushdown pg_node_attr(read_write_ignore);
+
+	/*
+	 * When partial aggregation has been pushed into a recursive CTE, the
+	 * outer query's Agg must use this AggSplit (AGGSPLIT_FINAL_DESERIAL)
+	 * instead of AGGSPLIT_SIMPLE.  Zero means no override.
+	 */
+	AggSplit	cte_pushed_aggsplit;
 
 	/*
 	 * These fields are workspace for createplan.c

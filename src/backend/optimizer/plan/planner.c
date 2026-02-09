@@ -700,6 +700,8 @@ subquery_planner(PlannerGlobal *glob, Query *parse, PlannerInfo *parent_root,
 	else
 		root->wt_param_id = -1;
 	root->non_recursive_path = NULL;
+	root->partial_agg_pushdown = NULL;
+	root->cte_pushed_aggsplit = AGGSPLIT_SIMPLE;
 	root->partColsUpdated = false;
 
 	/*
@@ -3788,7 +3790,10 @@ create_grouping_paths(PlannerInfo *root,
 	AggClauseCosts agg_costs;
 
 	MemSet(&agg_costs, 0, sizeof(AggClauseCosts));
-	get_agg_clause_costs(root, AGGSPLIT_SIMPLE, &agg_costs);
+	get_agg_clause_costs(root,
+						 root->cte_pushed_aggsplit != AGGSPLIT_SIMPLE
+						 ? root->cte_pushed_aggsplit : AGGSPLIT_SIMPLE,
+						 &agg_costs);
 
 	/*
 	 * Create grouping relation to hold fully aggregated grouping and/or
@@ -3850,8 +3855,12 @@ create_grouping_paths(PlannerInfo *root,
 
 		/*
 		 * Determine whether partial aggregation is possible.
+		 *
+		 * If we already pushed partial aggregation into a recursive CTE, skip
+		 * the standard partial-agg path to avoid double-splitting.
 		 */
-		if (can_partial_agg(root))
+		if (root->cte_pushed_aggsplit == AGGSPLIT_SIMPLE &&
+			can_partial_agg(root))
 			flags |= GROUPING_CAN_PARTIAL_AGG;
 
 		extra.flags = flags;
@@ -7136,15 +7145,19 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 				{
 					/*
 					 * We have aggregation, possibly with plain GROUP BY. Make
-					 * an AggPath.
+					 * an AggPath.  If partial aggregation was pushed into a
+					 * recursive CTE, use FINAL_DESERIAL instead of SIMPLE.
 					 */
+					AggSplit	aggsplit = root->cte_pushed_aggsplit != AGGSPLIT_SIMPLE
+						? root->cte_pushed_aggsplit : AGGSPLIT_SIMPLE;
+
 					add_path(grouped_rel, (Path *)
 							 create_agg_path(root,
 											 grouped_rel,
 											 path,
 											 grouped_rel->reltarget,
 											 parse->groupClause ? AGG_SORTED : AGG_PLAIN,
-											 AGGSPLIT_SIMPLE,
+											 aggsplit,
 											 info->clauses,
 											 havingQual,
 											 agg_costs,
@@ -7250,13 +7263,18 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 			/*
 			 * Generate a HashAgg Path.  We just need an Agg over the
 			 * cheapest-total input path, since input order won't matter.
+			 * If partial aggregation was pushed into a recursive CTE,
+			 * use FINAL_DESERIAL instead of SIMPLE.
 			 */
+			AggSplit	aggsplit = root->cte_pushed_aggsplit != AGGSPLIT_SIMPLE
+				? root->cte_pushed_aggsplit : AGGSPLIT_SIMPLE;
+
 			add_path(grouped_rel, (Path *)
 					 create_agg_path(root, grouped_rel,
 									 cheapest_path,
 									 grouped_rel->reltarget,
 									 AGG_HASHED,
-									 AGGSPLIT_SIMPLE,
+									 aggsplit,
 									 root->processed_groupClause,
 									 havingQual,
 									 agg_costs,
