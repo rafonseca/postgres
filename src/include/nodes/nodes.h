@@ -389,6 +389,8 @@ typedef enum AggSplit
 	AGGSPLIT_INITIAL_SERIAL = AGGSPLITOP_SKIPFINAL | AGGSPLITOP_SERIALIZE,
 	/* Final phase of partial aggregation, with deserialization: */
 	AGGSPLIT_FINAL_DESERIAL = AGGSPLITOP_COMBINE | AGGSPLITOP_DESERIALIZE,
+	AGGSPLIT_SKIPFINAL = AGGSPLITOP_SKIPFINAL,
+	AGGSPLIT_COMBINE = AGGSPLITOP_COMBINE,
 } AggSplit;
 
 /* Test whether an AggSplit value selects each primitive option: */

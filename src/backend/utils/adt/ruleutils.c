@@ -11058,8 +11058,18 @@ get_agg_combine_expr(Node *node, deparse_context *context, void *callback_arg)
 	Aggref	   *aggref;
 	Aggref	   *original_aggref = callback_arg;
 
+	/*
+	 * Normally the inner node is an Aggref (the partial aggregate).
+	 * However, when partial aggregation was pushed into a recursive CTE,
+	 * the combining Aggref's input comes from a CteScan rather than
+	 * another Agg node, so the resolved node may be a Var.  In that case,
+	 * display using the original aggref.
+	 */
 	if (!IsA(node, Aggref))
-		elog(ERROR, "combining Aggref does not point to an Aggref");
+	{
+		get_agg_expr(original_aggref, context, original_aggref);
+		return;
+	}
 
 	aggref = (Aggref *) node;
 	get_agg_expr(aggref, context, original_aggref);

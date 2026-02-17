@@ -17,6 +17,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "catalog/pg_aggregate.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
@@ -34,6 +35,7 @@
 #include "optimizer/prep.h"
 #include "optimizer/subselect.h"
 #include "parser/parse_relation.h"
+#include "parser/parsetree.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -869,6 +871,583 @@ hash_ok_operator(OpExpr *expr)
 
 
 /*
+ * can_pushdown_partial_agg_to_recursive_cte
+ *
+ * Determine whether partial aggregation can be pushed into a recursive CTE.
+ * If so, return a PartialAggPushdownInfo descriptor; otherwise return NULL.
+ *
+ * Conditions checked:
+ * 1. CTE is recursive with UNION ALL (not UNION)
+ * 2. CTE is referenced exactly once (cterefcount == 1)
+ * 3. Outer query has aggregation with GROUP BY, no HAVING
+ * 4. Outer query FROM is just the CTE (single RTE_CTE)
+ * 5. All aggregates have combinefn, no finalfn, non-INTERNAL transtype
+ * 6. Each aggregate's input is a simple Var referencing a CTE column
+ * 7. Each GROUP BY column references a CTE output column
+ * 8. In the recursive term, aggregated columns are simple Var refs to the
+ *    worktable (self-reference)
+ */
+static PartialAggPushdownInfo *
+can_pushdown_partial_agg_to_recursive_cte(PlannerInfo *root,
+										  CommonTableExpr *cte)
+{
+	Query	   *parse = root->parse;
+	Query	   *ctequery;
+	SetOperationStmt *setOp;
+	Query	   *recursive_term;
+	RangeTblEntry *cte_rte;
+	Index		cte_rtindex;
+	int			self_ref_rtindex;
+	ListCell   *lc;
+	PartialAggPushdownInfo *info;
+	List	   *groupColPositions = NIL;
+	List	   *groupSGCs = NIL;
+	List	   *aggColPositions = NIL;
+	List	   *outerAggrefs = NIL;
+	List	   *aggTransTypes = NIL;
+	List	   *aggCombineFnOids = NIL;
+	List	   *aggFinalFnOids = NIL;
+	List	   *aggOutputTypes = NIL;
+
+	/* Must be a recursive CTE */
+	if (!cte->cterecursive)
+	{
+		elog(DEBUG1, "partial_agg_pushdown: CTE not recursive");
+		return NULL;
+	}
+
+	/* Must be referenced exactly once */
+	if (cte->cterefcount != 1)
+	{
+		elog(DEBUG1, "partial_agg_pushdown: cterefcount=%d", cte->cterefcount);
+		return NULL;
+	}
+
+	/* Outer query must have aggregation */
+	if (!parse->hasAggs || parse->groupClause == NIL)
+	{
+		elog(DEBUG1, "partial_agg_pushdown: no aggs or no group clause");
+		return NULL;
+	}
+
+	/* No HAVING clause */
+	if (parse->havingQual != NULL)
+	{
+		elog(DEBUG1, "partial_agg_pushdown: has HAVING");
+		return NULL;
+	}
+
+	/* No grouping sets */
+	if (parse->groupingSets != NIL)
+	{
+		elog(DEBUG1, "partial_agg_pushdown: has grouping sets");
+		return NULL;
+	}
+
+	/*
+	 * Outer query FROM must be a single RTE_CTE referencing this CTE.
+	 */
+	if (list_length(parse->rtable) < 1)
+		return NULL;
+
+	cte_rte = NULL;
+	cte_rtindex = 0;
+	{
+		int			rtidx = 0;
+		ListCell   *rtlc;
+		FromExpr   *from;
+		RangeTblRef *rtr;
+
+		foreach(rtlc, parse->rtable)
+		{
+			RangeTblEntry *r = (RangeTblEntry *) lfirst(rtlc);
+
+			rtidx++;
+			elog(DEBUG1, "partial_agg_pushdown: outer rtable[%d]: kind=%d", rtidx, r->rtekind);
+		}
+		from = parse->jointree;
+
+		/* Must be a simple FROM with one entry, no quals */
+		if (from == NULL || list_length(from->fromlist) != 1 ||
+			from->quals != NULL)
+		{
+			elog(DEBUG1, "partial_agg_pushdown: FROM not simple (from=%p, fromlist=%d, quals=%p)",
+				 from, from ? list_length(from->fromlist) : 0, from ? from->quals : NULL);
+			return NULL;
+		}
+
+		if (!IsA(linitial(from->fromlist), RangeTblRef))
+		{
+			elog(DEBUG1, "partial_agg_pushdown: FROM entry not RangeTblRef");
+			return NULL;
+		}
+
+		rtr = (RangeTblRef *) linitial(from->fromlist);
+		cte_rtindex = rtr->rtindex;
+		cte_rte = rt_fetch(cte_rtindex, parse->rtable);
+
+		if (cte_rte->rtekind != RTE_CTE)
+		{
+			elog(DEBUG1, "partial_agg_pushdown: RTE not CTE (kind=%d)", cte_rte->rtekind);
+			return NULL;
+		}
+		if (strcmp(cte_rte->ctename, cte->ctename) != 0)
+		{
+			elog(DEBUG1, "partial_agg_pushdown: CTE name mismatch (%s vs %s)",
+				 cte_rte->ctename, cte->ctename);
+			return NULL;
+		}
+	}
+
+	/* Check the CTE subquery: must be UNION or UNION ALL */
+	ctequery = (Query *) cte->ctequery;
+	if (ctequery->setOperations == NULL)
+	{
+		elog(DEBUG1, "partial_agg_pushdown: no setOperations");
+		return NULL;
+	}
+	setOp = castNode(SetOperationStmt, ctequery->setOperations);
+	if (setOp->op != SETOP_UNION)
+	{
+		elog(DEBUG1, "partial_agg_pushdown: not UNION (op=%d)",
+			 setOp->op);
+		return NULL;
+	}
+
+	/*
+	 * Get the recursive term (right child of UNION ALL).  We need to check
+	 * that the aggregated columns are simple Var references to the self-ref
+	 * RTE (worktable).
+	 */
+	if (!IsA(setOp->rarg, RangeTblRef))
+	{
+		elog(DEBUG1, "partial_agg_pushdown: rarg not RangeTblRef (type=%d)",
+			 nodeTag(setOp->rarg));
+		return NULL;
+	}
+	{
+		int			rarg_rtindex = ((RangeTblRef *) setOp->rarg)->rtindex;
+		RangeTblEntry *rarg_rte;
+
+		rarg_rte = rt_fetch(rarg_rtindex, ctequery->rtable);
+		elog(DEBUG1, "partial_agg_pushdown: rarg RTE kind=%d, has subquery=%d",
+			 rarg_rte->rtekind, rarg_rte->subquery != NULL);
+		recursive_term = rarg_rte->subquery;
+		if (recursive_term == NULL)
+		{
+			elog(DEBUG1, "partial_agg_pushdown: recursive term subquery is NULL");
+			return NULL;
+		}
+	}
+
+	/*
+	 * Find the self-reference RTE index in the recursive term.  It's the
+	 * RTE_CTE entry whose ctename matches our CTE.
+	 */
+	self_ref_rtindex = 0;
+	{
+		int			idx = 0;
+
+		foreach(lc, recursive_term->rtable)
+		{
+			RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+			idx++;
+			elog(DEBUG1, "partial_agg_pushdown: rec term RTE[%d]: kind=%d, ctename=%s, ctelevelsup=%d, self_ref=%d",
+				 idx, rte->rtekind,
+				 rte->rtekind == RTE_CTE ? rte->ctename : "(n/a)",
+				 rte->rtekind == RTE_CTE ? rte->ctelevelsup : -1,
+				 rte->rtekind == RTE_CTE ? rte->self_reference : -1);
+			if (rte->rtekind == RTE_CTE &&
+				strcmp(rte->ctename, cte->ctename) == 0 &&
+				rte->self_reference)
+			{
+				self_ref_rtindex = idx;
+				break;
+			}
+		}
+		if (self_ref_rtindex == 0)
+		{
+			elog(DEBUG1, "partial_agg_pushdown: no self-reference RTE found");
+			return NULL;
+		}
+		elog(DEBUG1, "partial_agg_pushdown: self_ref_rtindex=%d", self_ref_rtindex);
+	}
+
+	/*
+	 * Check each GROUP BY column: must reference a CTE output column.
+	 */
+	foreach(lc, parse->groupClause)
+	{
+		SortGroupClause *sgc = (SortGroupClause *) lfirst(lc);
+		TargetEntry *tle;
+		Var		   *var;
+		Var		   *real_var;
+
+		tle = get_sortgroupclause_tle(sgc, parse->targetList);
+		if (tle == NULL)
+			return NULL;
+
+		if (!IsA(tle->expr, Var))
+			return NULL;
+
+		var = (Var *) tle->expr;
+
+		/*
+		 * If this Var references the RTE_GROUP RTE, resolve it to the
+		 * underlying group expression (which should be a Var referencing
+		 * the CTE).
+		 */
+		real_var = var;
+		if (var->varlevelsup == 0)
+		{
+			RangeTblEntry *var_rte = rt_fetch(var->varno, parse->rtable);
+
+			if (var_rte->rtekind == RTE_GROUP)
+			{
+				Node	   *groupexpr;
+
+				Assert(var->varattno > 0);
+				groupexpr = (Node *) list_nth(var_rte->groupexprs,
+											  var->varattno - 1);
+				if (!IsA(groupexpr, Var))
+					return NULL;
+				real_var = (Var *) groupexpr;
+			}
+		}
+
+		if (real_var->varno != cte_rtindex || real_var->varlevelsup != 0)
+			return NULL;
+
+		groupColPositions = lappend_int(groupColPositions, real_var->varattno);
+		groupSGCs = lappend(groupSGCs, copyObject(sgc));
+	}
+
+	/*
+	 * Check each Aggref in the target list.
+	 */
+	foreach(lc, parse->targetList)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		Aggref	   *aggref;
+		TargetEntry *agg_arg_tle;
+		Var		   *agg_var;
+		HeapTuple	aggTuple;
+		Form_pg_aggregate aggform;
+		int			cte_colpos;
+
+		elog(DEBUG1, "partial_agg_pushdown: tlist entry type=%d", nodeTag(tle->expr));
+		if (!IsA(tle->expr, Aggref))
+			continue;
+
+		aggref = (Aggref *) tle->expr;
+
+		/* Must be a simple aggregate (not ordered-set, not DISTINCT, etc.) */
+		if (aggref->aggorder != NIL ||
+			aggref->aggdistinct != NIL ||
+			aggref->aggfilter != NULL ||
+			aggref->aggstar ||
+			aggref->aggvariadic)
+			return NULL;
+
+		/* Must have exactly one argument */
+		if (list_length(aggref->args) != 1)
+		{
+			elog(DEBUG1, "partial_agg_pushdown: agg has %d args", list_length(aggref->args));
+			return NULL;
+		}
+
+		/* Must belong to this query level */
+		if (aggref->agglevelsup != 0)
+			return NULL;
+
+		/* The argument must be a simple Var referencing the CTE */
+		agg_arg_tle = (TargetEntry *) linitial(aggref->args);
+		if (!IsA(agg_arg_tle->expr, Var))
+			return NULL;
+
+		agg_var = (Var *) agg_arg_tle->expr;
+		if (agg_var->varno != cte_rtindex || agg_var->varlevelsup != 0)
+			return NULL;
+
+		cte_colpos = agg_var->varattno;
+
+		/* Check this column is not also a GROUP BY column */
+		if (list_member_int(groupColPositions, cte_colpos))
+			return NULL;
+
+		/* Each aggregate must reference a unique CTE column */
+		if (list_member_int(aggColPositions, cte_colpos))
+		{
+			elog(DEBUG1, "partial_agg_pushdown: duplicate agg column %d",
+				 cte_colpos);
+			return NULL;
+		}
+
+		/* Look up pg_aggregate for this aggregate */
+		aggTuple = SearchSysCache1(AGGFNOID,
+								   ObjectIdGetDatum(aggref->aggfnoid));
+		if (!HeapTupleIsValid(aggTuple))
+			elog(ERROR, "cache lookup failed for aggregate %u",
+				 aggref->aggfnoid);
+		aggform = (Form_pg_aggregate) GETSTRUCT(aggTuple);
+
+		elog(DEBUG1, "partial_agg_pushdown: checking agg %u: combinefn=%u, finalfn=%u, transtype=%u",
+			 aggref->aggfnoid, aggform->aggcombinefn, aggform->aggfinalfn,
+			 aggform->aggtranstype);
+
+		/* Must have combinefn */
+		if (!OidIsValid(aggform->aggcombinefn))
+		{
+			elog(DEBUG1, "partial_agg_pushdown: no combinefn");
+			ReleaseSysCache(aggTuple);
+			return NULL;
+		}
+
+		/* Transition type must not be INTERNAL */
+		if (aggform->aggtranstype == INTERNALOID)
+		{
+			elog(DEBUG1, "partial_agg_pushdown: INTERNAL transtype");
+			ReleaseSysCache(aggTuple);
+			return NULL;
+		}
+
+		aggColPositions = lappend_int(aggColPositions, cte_colpos);
+		outerAggrefs = lappend(outerAggrefs, copyObject(aggref));
+		aggTransTypes = lappend_oid(aggTransTypes, aggform->aggtranstype);
+		aggCombineFnOids = lappend_oid(aggCombineFnOids,
+									   aggform->aggcombinefn);
+		aggFinalFnOids = lappend_oid(aggFinalFnOids,
+									 aggform->aggfinalfn);
+		aggOutputTypes = lappend_oid(aggOutputTypes, aggref->aggtype);
+
+		ReleaseSysCache(aggTuple);
+	}
+
+	/* Must have at least one aggregate to push down */
+	if (aggColPositions == NIL)
+	{
+		elog(DEBUG1, "partial_agg_pushdown: no aggregates found in targetlist");
+		return NULL;
+	}
+
+	/*
+	 * Verify that in the recursive term, each aggregated CTE column either:
+	 * (a) is a simple Var reference to the worktable (will be retyped to
+	 *     transtype during plan construction), or
+	 * (b) is an expression whose result type already equals transtype.
+	 *
+	 * Case (b) naturally holds when transtype = input type (e.g. MIN, MAX),
+	 * allowing computed expressions like r.w + e.weight for shortest-path
+	 * queries. For aggregates where transtype != input type (e.g. SUM, AVG),
+	 * only simple Var references are accepted unless the user provides a
+	 * custom function returning transtype.
+	 */
+	{
+		ListCell   *lc2;
+		ListCell   *lc3;
+
+		forboth(lc2, aggColPositions, lc3, aggTransTypes)
+		{
+			int			colpos = lfirst_int(lc2);
+			Oid			transtype = lfirst_oid(lc3);
+			TargetEntry *rec_tle;
+
+			rec_tle = (TargetEntry *) list_nth(recursive_term->targetList,
+											   colpos - 1);
+			if (rec_tle == NULL)
+				return NULL;
+
+			/* Simple Var to worktable — will be retyped in prepunion.c */
+			if (IsA(rec_tle->expr, Var))
+			{
+				Var	   *rec_var = (Var *) rec_tle->expr;
+
+				if (rec_var->varno == (Index) self_ref_rtindex &&
+					rec_var->varlevelsup == 0)
+					continue;
+			}
+
+			/* Computed expression — result type must equal transtype */
+			if (exprType((Node *) rec_tle->expr) != transtype)
+			{
+				elog(DEBUG1, "partial_agg_pushdown: recursive term expr type %u != transtype %u",
+					 exprType((Node *) rec_tle->expr), transtype);
+				return NULL;
+			}
+		}
+	}
+
+	elog(DEBUG1, "partial_agg_pushdown: all checks passed! groupCols=%d, aggCols=%d",
+		 list_length(groupColPositions), list_length(aggColPositions));
+
+	/* All checks passed -- build the descriptor */
+	info = (PartialAggPushdownInfo *) palloc(sizeof(PartialAggPushdownInfo));
+	info->groupColPositions = groupColPositions;
+	info->groupSortGroupClauses = groupSGCs;
+	info->aggColPositions = aggColPositions;
+	info->outerAggrefs = outerAggrefs;
+	info->aggTransTypes = aggTransTypes;
+	info->aggCombineFnOids = aggCombineFnOids;
+	info->aggFinalFnOids = aggFinalFnOids;
+	info->aggOutputTypes = aggOutputTypes;
+
+	return info;
+}
+
+/*
+ * adjust_outer_query_for_partial_agg_cte
+ *
+ * After a recursive CTE has been planned with partial aggregation pushed
+ * down, update the outer query so that:
+ * 1. cte->ctecoltypes reflects the new output types (transition types for
+ *    aggregated columns)
+ * 2. The CTE's RTE in the outer query has updated coltypes
+ * 3. Var nodes referencing the aggregated CTE columns are updated
+ * 4. The outer Aggrefs are marked with AGGSPLIT_FINAL_DESERIAL
+ */
+static void
+adjust_outer_query_for_partial_agg_cte(PlannerInfo *root,
+									   CommonTableExpr *cte,
+									   PartialAggPushdownInfo *info)
+{
+	Query	   *parse = root->parse;
+	ListCell   *lc;
+	ListCell   *lc2;
+	ListCell   *lc3;
+	Index		cte_rtindex = 0;
+	RangeTblEntry *cte_rte = NULL;
+
+	/*
+	 * Find the CTE's RTE in the outer query.
+	 */
+	{
+		int			idx = 0;
+
+		foreach(lc, parse->rtable)
+		{
+			RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+			idx++;
+			if (rte->rtekind == RTE_CTE &&
+				strcmp(rte->ctename, cte->ctename) == 0)
+			{
+				cte_rte = rte;
+				cte_rtindex = idx;
+				break;
+			}
+		}
+	}
+
+	if (cte_rte == NULL)
+		return;					/* shouldn't happen */
+
+	/*
+	 * Update cte->ctecoltypes and rte->coltypes for aggregated columns.
+	 * The aggregated columns change from their original type to the transition
+	 * type (e.g., int4 -> int8 for sum(int4)).
+	 */
+	forboth(lc, info->aggColPositions, lc2, info->aggTransTypes)
+	{
+		int			colpos = lfirst_int(lc);
+		Oid			transtype = lfirst_oid(lc2);
+		ListCell   *ctecell;
+		ListCell   *rtecell;
+
+		/* Update ctecoltypes (1-based position, 0-based list index) */
+		ctecell = list_nth_cell(cte->ctecoltypes, colpos - 1);
+		lfirst_oid(ctecell) = transtype;
+
+		/* Update rte->coltypes */
+		rtecell = list_nth_cell(cte_rte->coltypes, colpos - 1);
+		lfirst_oid(rtecell) = transtype;
+	}
+
+	/*
+	 * Walk the outer query's target list and update Var nodes and Aggrefs.
+	 */
+	foreach(lc, parse->targetList)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+		/* Update Var nodes referencing aggregated CTE columns */
+		if (IsA(tle->expr, Var))
+		{
+			Var		   *var = (Var *) tle->expr;
+
+			if (var->varno == cte_rtindex)
+			{
+				forboth(lc2, info->aggColPositions, lc3, info->aggTransTypes)
+				{
+					if (var->varattno == lfirst_int(lc2))
+					{
+						var->vartype = lfirst_oid(lc3);
+						break;
+					}
+				}
+			}
+		}
+
+		/* Update Aggrefs: change to FINAL_DESERIAL and fix input Var types */
+		if (IsA(tle->expr, Aggref))
+		{
+			Aggref	   *aggref = (Aggref *) tle->expr;
+			TargetEntry *agg_arg_tle;
+			Var		   *agg_var;
+
+			/* Change the aggsplit to FINAL_DESERIAL */
+			aggref->aggsplit = AGGSPLIT_FINAL_DESERIAL;
+
+			/*
+			 * Update the input Var's type to the transition type.  The arg
+			 * is a Var referencing the CTE column, which now outputs the
+			 * transition type.
+			 */
+			if (list_length(aggref->args) == 1)
+			{
+				agg_arg_tle = (TargetEntry *) linitial(aggref->args);
+				if (IsA(agg_arg_tle->expr, Var))
+				{
+					agg_var = (Var *) agg_arg_tle->expr;
+					if (agg_var->varno == cte_rtindex)
+					{
+						forboth(lc2, info->aggColPositions, lc3, info->aggTransTypes)
+						{
+							if (agg_var->varattno == lfirst_int(lc2))
+							{
+								agg_var->vartype = lfirst_oid(lc3);
+								break;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	/*
+	 * Every aggregate has an extra "finalized" column in the CTE output.
+	 * Extend cte/rte column metadata so column counts stay consistent.
+	 * The outer query doesn't reference these columns, but they must be
+	 * present in the metadata.  For no-finalfn aggs, output_type ==
+	 * transtype, so the type is correct either way.
+	 */
+	foreach(lc, info->aggOutputTypes)
+	{
+		Oid			output_type = lfirst_oid(lc);
+
+		cte->ctecoltypes = lappend_oid(cte->ctecoltypes, output_type);
+		cte->ctecoltypmods = lappend_int(cte->ctecoltypmods, -1);
+		cte->ctecolcollations = lappend_oid(cte->ctecolcollations, InvalidOid);
+
+		cte_rte->coltypes = lappend_oid(cte_rte->coltypes, output_type);
+		cte_rte->coltypmods = lappend_int(cte_rte->coltypmods, -1);
+		cte_rte->colcollations = lappend_oid(cte_rte->colcollations, InvalidOid);
+	}
+
+}
+
+/*
  * SS_process_ctes: process a query's WITH list
  *
  * Consider each CTE in the WITH list and either ignore it (if it's an
@@ -965,6 +1544,135 @@ SS_process_ctes(PlannerInfo *root)
 		Assert(root->plan_params == NIL);
 
 		/*
+		 * Check if we can push partial aggregation into a recursive CTE.
+		 * If so, store the descriptor on root so that generate_recursion_path
+		 * (called inside subquery_planner) can see it via parent_root.
+		 */
+
+		if (cte->cterecursive &&
+			(root->rec_cte_partial_agg= can_pushdown_partial_agg_to_recursive_cte(root, cte)))
+		{
+			/*
+			 * Update the CTE subquery to reflect the new column types
+			 * for aggregated columns.  We update:
+			 * 1. Self-reference RTE coltypes (for WorkTableScan)
+			 * 2. Var nodes in the recursive term referencing the
+			 *    self-reference (so WorkTableScan plan gets right types)
+			 *
+			 * Note: SetOperationStmt colTypes is NOT updated here.
+			 * It is updated in generate_recursion_path() between the
+			 * two recurse_set_operations() calls, so the base term
+			 * sees original types (no impossible casts like int4→int8[])
+			 * while the recursive term sees transition types.
+			 */
+			PartialAggPushdownInfo * pushdown = root->rec_cte_partial_agg;			
+			SetOperationStmt *sop;
+			int			rarg_rti;
+			RangeTblEntry *rarg_rte;
+			Query	   *rec_term;
+			ListCell   *lc_rt;
+			ListCell   *lc_pos;
+			ListCell   *lc_trans;
+			Index		selfref_varno = 0;
+			elog(DEBUG1, "partial_agg_pushdown: entering pushdown block");
+
+			sop = castNode(SetOperationStmt, subquery->setOperations);
+
+			rarg_rti = ((RangeTblRef *) sop->rarg)->rtindex;
+			rarg_rte = rt_fetch(rarg_rti, subquery->rtable);
+			rec_term = rarg_rte->subquery;
+
+			/* 2. Find and update self-reference RTE coltypes */
+			foreach(lc_rt, rec_term->rtable)
+			{
+				RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc_rt);
+
+				if (rte->rtekind == RTE_CTE &&
+					rte->self_reference &&
+					strcmp(rte->ctename, cte->ctename) == 0)
+				{
+					selfref_varno = foreach_current_index(lc_rt) + 1;
+
+					forboth(lc_pos, pushdown->aggColPositions,
+							lc_trans, pushdown->aggTransTypes)
+					{
+						int			colpos = lfirst_int(lc_pos);
+						Oid			transtype = lfirst_oid(lc_trans);
+						ListCell   *cell;
+
+						cell = list_nth_cell(rte->coltypes,
+											 colpos - 1);
+						lfirst_oid(cell) = transtype;
+					}
+					break;
+				}
+			}
+
+			/*
+			 * 3. Update Var nodes in the recursive term's targetlist
+			 * that reference the self-reference RTE for aggregated
+			 * columns.
+			 */
+			if (selfref_varno > 0)
+			{
+				ListCell   *lc_tle;
+
+				foreach(lc_tle, rec_term->targetList)
+				{
+					TargetEntry *tle = (TargetEntry *) lfirst(lc_tle);
+
+					if (IsA(tle->expr, Var))
+					{
+						Var		   *var = (Var *) tle->expr;
+
+						if (var->varno == selfref_varno &&
+							var->varlevelsup == 0)
+						{
+							forboth(lc_pos, pushdown->aggColPositions,
+									lc_trans, pushdown->aggTransTypes)
+							{
+								int		colpos = lfirst_int(lc_pos);
+								Oid		transtype = lfirst_oid(lc_trans);
+
+								if (var->varattno == colpos)
+								{
+									var->vartype = transtype;
+									break;
+								}
+							}
+						}
+					}
+				}
+			}
+		 
+
+			/*
+			 * Every aggregate gets an extra "finalized" column in
+			 * the setop output.  Extend the CTE subquery's
+			 * targetList so postprocess_setop_tlist (called inside
+			 * subquery_planner) sees matching column counts.
+			 */
+			{
+				AttrNumber	next_resno;
+				int			agg_count;
+				int			i;
+
+				next_resno = list_length(subquery->targetList) + 1;
+				agg_count = list_length(pushdown->outerAggrefs);
+				for (i = 0; i < agg_count; i++)
+				{
+					subquery->targetList = lappend(subquery->targetList,
+						makeTargetEntry(
+							(Expr *) makeNullConst(INT4OID, -1,
+												   InvalidOid),
+							next_resno, pstrdup("?col?"),
+							false));
+					next_resno++;
+				}
+			}
+		}
+
+		/*
 		 * Generate Paths for the CTE query.  Always plan for full retrieval
 		 * --- we don't have enough info to predict otherwise.
 		 */
@@ -979,6 +1687,17 @@ SS_process_ctes(PlannerInfo *root)
 		 */
 		if (root->plan_params)
 			elog(ERROR, "unexpected outer reference in CTE query");
+
+		/*
+		 * If we pushed partial aggregation into this CTE, adjust the outer
+		 * query's types and Aggrefs accordingly, then clear the descriptor.
+		 */
+		if (root->rec_cte_partial_agg != NULL)
+		{
+			adjust_outer_query_for_partial_agg_cte(root, cte,
+												   root->rec_cte_partial_agg);
+			root->rec_cte_partial_agg = NULL;
+		}
 
 		/*
 		 * Select best Path and turn it into a Plan.  At least for now, there

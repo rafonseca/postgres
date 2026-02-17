@@ -26,6 +26,7 @@
 #include <math.h>
 
 #include "access/htup_details.h"
+#include "catalog/pg_aggregate.h"
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -401,6 +402,34 @@ generate_recursion_path(SetOperationStmt *setOp, PlannerInfo *root,
 	lpath = lrel->cheapest_total_path;
 	/* The right path will want to look at the left one ... */
 	root->non_recursive_path = lpath;
+
+	/*
+	 * If partial aggregate pushdown is active, update setOp->colTypes for
+	 * aggregated columns to the transition types BEFORE processing the
+	 * recursive term.  The base term was processed above with original types
+	 * (avoiding impossible casts like int4 → int8[]).  The recursive term
+	 * needs transition types because its self-reference Vars have been retyped
+	 * to transition types by SS_process_ctes().
+	 */
+	if (root->parent_root &&
+		root->parent_root->rec_cte_partial_agg != NULL)
+	{
+		PartialAggPushdownInfo *pushdown = root->parent_root->rec_cte_partial_agg;
+		ListCell   *lc_pos;
+		ListCell   *lc_trans;
+
+		forboth(lc_pos, pushdown->aggColPositions,
+				lc_trans, pushdown->aggTransTypes)
+		{
+			int			colpos = lfirst_int(lc_pos);
+			Oid			transtype = lfirst_oid(lc_trans);
+			ListCell   *cell;
+
+			cell = list_nth_cell(setOp->colTypes, colpos - 1);
+			lfirst_oid(cell) = transtype;
+		}
+	}
+
 	rrel = recurse_set_operations(setOp->rarg, root,
 								  NULL, /* no value in sorted results */
 								  setOp->colTypes, setOp->colCollations,
@@ -412,6 +441,332 @@ generate_recursion_path(SetOperationStmt *setOp, PlannerInfo *root,
 								NIL, NULL);
 	rpath = rrel->cheapest_total_path;
 	root->non_recursive_path = NULL;
+
+	/*
+	 * If partial aggregate pushdown is active, wrap lpath and rpath with Agg
+	 * paths and update the setOp column types to reflect the transition types.
+	 */
+	if (root->parent_root &&
+		root->parent_root->rec_cte_partial_agg != NULL)
+	{
+		PartialAggPushdownInfo *pushdown = root->parent_root->rec_cte_partial_agg;
+		ListCell   *lc_pos;
+		ListCell   *lc_trans;
+		ListCell   *lc_combine;
+		ListCell   *lc_agg;
+		List	   *inner_group_clause = NIL;
+		PathTarget *initial_target;
+		PathTarget *final_target;
+		List	   *initial_tlist;
+		List	   *final_tlist;
+		AttrNumber	resno;
+		int			sgref;
+		int			aggno_counter;
+		AggClauseCosts dummy_costs;
+
+		memset(&dummy_costs, 0, sizeof(AggClauseCosts));
+
+		/*
+		 * Build the PathTarget/tlist for the Agg nodes.  It contains:
+		 * 1. GROUP BY columns (same types as before)
+		 * 2. Aggregated columns (output type = transition type)
+		 *
+		 * We build separate targets for INITIAL_SERIAL and FINAL_DESERIAL
+		 * because the input types differ (original vs transition state).
+		 */
+		initial_target = create_empty_pathtarget();
+		final_target = create_empty_pathtarget();
+		initial_tlist = NIL;
+		final_tlist = NIL;
+		resno = 1;
+		sgref = 1;
+
+		/* Add GROUP BY columns to targets */
+		foreach(lc_pos, pushdown->groupColPositions)
+		{
+			int			colpos = lfirst_int(lc_pos);
+			TargetEntry *ltle;
+			TargetEntry *rtle;
+			Var		   *lvar;
+			Var		   *rvar;
+			SortGroupClause *sgc;
+			TargetEntry *new_tle_l;
+			TargetEntry *new_tle_r;
+
+			/* Get the Var from the left (base) term's tlist */
+			ltle = (TargetEntry *) list_nth(lpath_tlist, colpos - 1);
+			lvar = copyObject((Var *) ltle->expr);
+
+			/* Get the Var from the right (recursive) term's tlist */
+			rtle = (TargetEntry *) list_nth(rpath_tlist, colpos - 1);
+			rvar = copyObject((Var *) rtle->expr);
+
+			/* Build a SortGroupClause for this column */
+			sgc = (SortGroupClause *) list_nth(pushdown->groupSortGroupClauses,
+											   foreach_current_index(lc_pos));
+			sgc = copyObject(sgc);
+			sgc->tleSortGroupRef = sgref;
+
+			/* Add to both targets */
+			new_tle_l = makeTargetEntry((Expr *) lvar, resno, NULL, false);
+			new_tle_l->ressortgroupref = sgref;
+			initial_tlist = lappend(initial_tlist, new_tle_l);
+			add_column_to_pathtarget(initial_target, (Expr *) lvar, sgref);
+
+			new_tle_r = makeTargetEntry((Expr *) rvar, resno, NULL, false);
+			new_tle_r->ressortgroupref = sgref;
+			final_tlist = lappend(final_tlist, new_tle_r);
+			add_column_to_pathtarget(final_target, (Expr *) rvar, sgref);
+
+			inner_group_clause = lappend(inner_group_clause, sgc);
+
+			resno++;
+			sgref++;
+		}
+
+		/* Add Aggref entries for each aggregate being pushed down */
+		aggno_counter = 0;
+		forfour(lc_pos, pushdown->aggColPositions,
+				lc_trans, pushdown->aggTransTypes,
+				lc_combine, pushdown->aggCombineFnOids,
+				lc_agg, pushdown->outerAggrefs)
+		{
+			int			colpos = lfirst_int(lc_pos);
+			Oid			transtype = lfirst_oid(lc_trans);
+			Aggref	   *outer_agg = (Aggref *) lfirst(lc_agg);
+			TargetEntry *ltle;
+			TargetEntry *rtle;
+			Aggref	   *initial_agg;
+			Aggref	   *final_agg;
+			Var		   *input_var_l;
+			Expr	   *input_expr_r;
+			TargetEntry *arg_tle_l;
+			TargetEntry *arg_tle_r;
+			TargetEntry *new_tle_l;
+			TargetEntry *new_tle_r;
+
+			/* Get the input Var from base term's tlist */
+			ltle = (TargetEntry *) list_nth(lpath_tlist, colpos - 1);
+			input_var_l = copyObject((Var *) ltle->expr);
+
+			/* Get the input expression from recursive term's tlist */
+			rtle = (TargetEntry *) list_nth(rpath_tlist, colpos - 1);
+			input_expr_r = copyObject(rtle->expr);
+
+			/*
+			 * Build the INITIAL_SERIAL Aggref for the base term.
+			 * This uses transfn (int4_sum for sum(int4)), input is original type.
+			 */
+			initial_agg = makeNode(Aggref);
+			initial_agg->aggfnoid = outer_agg->aggfnoid;
+			initial_agg->aggtype = transtype;	/* output = transition type */
+			initial_agg->aggcollid = outer_agg->aggcollid;
+			initial_agg->inputcollid = outer_agg->inputcollid;
+			initial_agg->aggtranstype = transtype;
+			initial_agg->aggargtypes = list_copy(outer_agg->aggargtypes);
+			arg_tle_l = makeTargetEntry((Expr *) input_var_l, 1, NULL, false);
+			initial_agg->args = list_make1(arg_tle_l);
+			initial_agg->aggorder = NIL;
+			initial_agg->aggdistinct = NIL;
+			initial_agg->aggfilter = NULL;
+			initial_agg->aggstar = false;
+			initial_agg->aggvariadic = false;
+			initial_agg->aggkind = outer_agg->aggkind;
+			initial_agg->agglevelsup = 0;
+			initial_agg->aggsplit = AGGSPLIT_INITIAL_SERIAL;
+			initial_agg->aggno = aggno_counter;
+			initial_agg->aggtransno = aggno_counter;
+			initial_agg->location = -1;
+
+			new_tle_l = makeTargetEntry((Expr *) initial_agg, resno,
+										NULL, false);
+			initial_tlist = lappend(initial_tlist, new_tle_l);
+			add_column_to_pathtarget(initial_target, (Expr *) initial_agg, 0);
+
+			/*
+			 * Build the FINAL_DESERIAL Aggref for the recursive term.
+			 * The input comes from the worktable which now stores int8
+			 * transition states.  We use combinefn (int8pl).
+			 */
+			final_agg = makeNode(Aggref);
+			final_agg->aggfnoid = outer_agg->aggfnoid;
+			final_agg->aggtype = transtype;		/* output = transition type */
+			final_agg->aggcollid = outer_agg->aggcollid;
+			final_agg->inputcollid = outer_agg->inputcollid;
+			final_agg->aggtranstype = transtype;
+			final_agg->aggargtypes = list_copy(outer_agg->aggargtypes);
+			/*
+			 * If the input is a simple Var, retype it to transtype (the
+			 * worktable column has been changed to transtype).  Otherwise it's
+			 * a computed expression whose type already equals transtype.
+			 */
+			if (IsA(input_expr_r, Var))
+				((Var *) input_expr_r)->vartype = transtype;
+			arg_tle_r = makeTargetEntry(input_expr_r, 1, NULL, false);
+			final_agg->args = list_make1(arg_tle_r);
+			final_agg->aggorder = NIL;
+			final_agg->aggdistinct = NIL;
+			final_agg->aggfilter = NULL;
+			final_agg->aggstar = false;
+			final_agg->aggvariadic = false;
+			final_agg->aggkind = outer_agg->aggkind;
+			final_agg->agglevelsup = 0;
+			final_agg->aggsplit = (AggSplit)(AGGSPLITOP_COMBINE | AGGSPLITOP_SKIPFINAL);
+			final_agg->aggno = aggno_counter;
+			final_agg->aggtransno = aggno_counter;
+			final_agg->location = -1;
+
+			aggno_counter++;
+
+			new_tle_r = makeTargetEntry((Expr *) final_agg, resno,
+										NULL, false);
+			final_tlist = lappend(final_tlist, new_tle_r);
+			add_column_to_pathtarget(final_target, (Expr *) final_agg, 0);
+
+			resno++;
+		}
+
+		/*
+		 * Note: setOp->colTypes for the original columns was already
+		 * updated above (between the recurse_set_operations calls).
+		 * generate_append_tlist will see the correct transition types.
+		 */
+
+		/*
+		 * Add a "finalized" extra column for EVERY aggregate.  For
+		 * aggregates with a finalfn (e.g. avg), this is
+		 * FuncExpr(finalfn, Aggref) → the human-readable result.
+		 * For aggregates without finalfn (e.g. sum, min, max), this is
+		 * a copy of the Aggref (identity — transtype == output type).
+		 *
+		 * This converges both code paths: every aggregate always gets
+		 * exactly two columns (state + finalized).
+		 */
+		{
+			ListCell   *lc_final;
+			ListCell   *lc_output;
+			int			agg_idx;
+			int			groupcol_count = list_length(pushdown->groupColPositions);
+
+			agg_idx = 0;
+			forboth(lc_final, pushdown->aggFinalFnOids,
+					lc_output, pushdown->aggOutputTypes)
+			{
+				Oid			finalfn_oid = lfirst_oid(lc_final);
+				Oid			output_type = lfirst_oid(lc_output);
+				Aggref	   *init_aggref;
+				Aggref	   *final_aggref;
+				Expr	   *init_finalexpr;
+				Expr	   *final_finalexpr;
+				TargetEntry *new_tle_l;
+				TargetEntry *new_tle_r;
+
+				/*
+				 * Find the Aggref we created for this aggregate in the
+				 * initial_tlist / final_tlist.  Aggregate entries start
+				 * after the GROUP BY columns.
+				 */
+				init_aggref = (Aggref *) ((TargetEntry *)
+					list_nth(initial_tlist, groupcol_count + agg_idx))->expr;
+				final_aggref = (Aggref *) ((TargetEntry *)
+					list_nth(final_tlist, groupcol_count + agg_idx))->expr;
+
+				if (OidIsValid(finalfn_oid))
+				{
+					/* Apply finalfn explicitly */
+					init_finalexpr = (Expr *) makeFuncExpr(
+						finalfn_oid, output_type,
+						list_make1(init_aggref),
+						InvalidOid, InvalidOid,
+						COERCE_EXPLICIT_CALL);
+					final_finalexpr = (Expr *) makeFuncExpr(
+						finalfn_oid, output_type,
+						list_make1(final_aggref),
+						InvalidOid, InvalidOid,
+						COERCE_EXPLICIT_CALL);
+				}
+				else
+				{
+					/*
+					 * No finalfn — transtype == output_type.  Duplicate
+					 * the Aggref as an identity column.  Both Aggrefs
+					 * share the same aggno, so the executor reads the
+					 * same ecxt_aggvalues slot for both.
+					 */
+					init_finalexpr = (Expr *) copyObject(init_aggref);
+					final_finalexpr = (Expr *) copyObject(final_aggref);
+				}
+
+				new_tle_l = makeTargetEntry(init_finalexpr,
+											resno, NULL, false);
+				initial_tlist = lappend(initial_tlist, new_tle_l);
+				add_column_to_pathtarget(initial_target,
+										 init_finalexpr, 0);
+
+				new_tle_r = makeTargetEntry(final_finalexpr,
+											resno, NULL, false);
+				final_tlist = lappend(final_tlist, new_tle_r);
+				add_column_to_pathtarget(final_target,
+										 final_finalexpr, 0);
+
+				/* Extend setOp column lists for the new column */
+				setOp->colTypes = lappend_oid(setOp->colTypes, output_type);
+				setOp->colTypmods = lappend_int(setOp->colTypmods, -1);
+				setOp->colCollations = lappend_oid(setOp->colCollations,
+												   InvalidOid);
+
+				/* Extend refnames_tlist with a dummy entry */
+				refnames_tlist = lappend(refnames_tlist,
+					makeTargetEntry(
+						(Expr *) makeNullConst(output_type, -1, InvalidOid),
+						resno, pstrdup("?col?"), false));
+
+				resno++;
+				agg_idx++;
+			}
+		}
+
+		/*
+		 * Wrap the base term (lpath) with HashAggregate INITIAL_SERIAL.
+		 */
+		lpath = (Path *) create_agg_path(root,
+										 lrel,
+										 lpath,
+										 initial_target,
+										 AGG_HASHED,
+										 AGGSPLIT_INITIAL_SERIAL,
+										 inner_group_clause,
+										 NIL,
+										 &dummy_costs,
+										 lpath->rows);
+
+		/*
+		 * Wrap the recursive term (rpath) with HashAggregate
+		 * COMBINE|SKIPFINAL.  COMBINE substitutes combinefn for transfn;
+		 * SKIPFINAL returns the transition state as-is.  For aggregates
+		 * with finalfn, the FuncExpr column applies finalization explicitly.
+		 */
+		rpath = (Path *) create_agg_path(root,
+										 rrel,
+										 rpath,
+										 final_target,
+										 AGG_HASHED,
+										 (AggSplit)(AGGSPLITOP_COMBINE | AGGSPLITOP_SKIPFINAL),
+										 inner_group_clause,
+										 NIL,
+										 &dummy_costs,
+										 rpath->rows);
+
+		/*
+		 * Update the non_recursive_path to point to the wrapped version, so
+		 * that the RecursiveUnion uses the aggregated output.
+		 */
+		root->non_recursive_path = lpath;
+
+		/* Build new lpath_tlist and rpath_tlist to match Agg outputs */
+		lpath_tlist = initial_tlist;
+		rpath_tlist = final_tlist;
+	}
 
 	/*
 	 * Generate tlist for RecursiveUnion path node --- same as in Append cases
